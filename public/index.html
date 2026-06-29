@@ -2771,6 +2771,7 @@ var visualGuideState = { bottomWasVisible: false, searchWasPeek: false, manual: 
 var emptyHomeActive = false;
 var homeForcedOpen = false;
 var homeSuppressed = false;
+var homeActivePlaylistIndex = -1;
 var homeDiscoverState = { loading: false, loaded: false, loggedIn: false, mode: 'starter', songs: [], playlists: [], podcasts: [], error: '', updatedAt: 0 };
 var homeDiscoverToken = 0;
 var homeVisualPresetActive = false;
@@ -16109,16 +16110,27 @@ function playHomeSong(index) {
   playQueueAt(currentIdx).catch(function(e){ console.warn('[HomeSongPlay]', e); });
 }
 function openHomePlaylist(index) {
+  var item = homeDiscoverState.playlists[index];
+  var panel = document.getElementById('playlist-panel');
+  var panelIsOpen = panel && (panel.classList.contains('show') || panel.classList.contains('peek'));
+  if (homeActivePlaylistIndex === index && panelIsOpen && playQueue.length) {
+    homeActivePlaylistIndex = -1;
+    togglePlaylistPanel(false);
+    showToast('已关闭歌单详情');
+    return;
+  }
+  homeActivePlaylistIndex = index;
   homeForcedOpen = false;
   homeSuppressed = false;
   setHomeControlsLocked(false);
   if (!hasAnyPlatformLogin() && !homeDiscoverState.loggedIn) {
+    homeActivePlaylistIndex = -1;
     runHomeSearch('');
     return;
   }
   openPlaylistPanelTab('playlists', true);
-  var item = homeDiscoverState.playlists[index];
   if (!item || !item.id) {
+    homeActivePlaylistIndex = -1;
     openHomeLibrary();
     return;
   }
@@ -16155,6 +16167,7 @@ function openHomeLibrary() {
   refreshUserPlaylists(true);
 }
 function goHome() {
+  homeActivePlaylistIndex = -1;
   if (homeForcedOpen || emptyHomeActive) {
     dismissHomePage({ toast: true });
     showToast('已关闭 Home');
@@ -16176,6 +16189,7 @@ function goHome() {
 }
 function dismissHomePage(opts) {
   opts = opts || {};
+  homeActivePlaylistIndex = -1;
   homeForcedOpen = false;
   homeSuppressed = true;
   setHomeControlsLocked(false);
@@ -19523,7 +19537,7 @@ function renderQueuePanel(opts) {
   renderMiniQueuePanel({ scrollCurrent: miniQueueOpen });
 }
 async function refreshUserPlaylists(force) {
-  if (!loginStatus.loggedIn && !qqLoginStatus.loggedIn) {
+  if (!loginStatus.loggedIn && !qqLoginStatus.loggedIn && !kgLoginStatus.loggedIn) {
     resetPlaylistPanelRenderLimit();
     document.getElementById('pl-list').innerHTML = '<div style="text-align:center;padding:24px 0;color:rgba(255,255,255,.32);font-size:11.5px">登录后显示个人歌单</div>';
     var podcastListLoggedOut = document.getElementById('podcast-list');
@@ -19532,8 +19546,10 @@ async function refreshUserPlaylists(force) {
   }
   if (force) resetPlaylistPanelRenderLimit();
   var hasCachedQQPlaylists = userPlaylists.some(function(pl){ return pl && pl.provider === 'qq'; });
+  var hasCachedKGPlaylists = userPlaylists.some(function(pl){ return pl && pl.provider === 'kugou'; });
   var needsQQRefresh = qqLoginStatus.loggedIn && !hasCachedQQPlaylists;
-  if (!force && !needsQQRefresh && (userPlaylists.length || myPodcastCollections.length)) {
+  var needsKGRefresh = kgLoginStatus.loggedIn && !hasCachedKGPlaylists;
+  if (!force && !needsQQRefresh && !needsKGRefresh && (userPlaylists.length || myPodcastCollections.length)) {
     var cachedAnimate = isPlaylistPanelVisibleForRender();
     renderUserPlaylistsList({ animate: cachedAnimate });
     renderMyPodcastCollections({ animate: cachedAnimate });

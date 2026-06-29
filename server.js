@@ -49,6 +49,7 @@ const https = require('https');
 const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const tls = require('tls');
 const { once } = require('events');
 const { fileURLToPath } = require('url');
@@ -3242,6 +3243,96 @@ async function kgGetSongUrl(hash, albumId, qualityPreference) {
 }
 
 // ============ 酷狗歌词 ============
+
+// KRC XOR decode key (16 bytes)
+var KRC_XOR_KEY = [64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105];
+
+// Decode KRC encrypted binary → plain KRC text
+// KRC format: 4-byte magic "krc1" + XOR-encrypted + zlib-compressed content
+function decodeKrc(bin) {
+  try {
+    if (bin.length <= 4) return null;
+    var payload = bin.slice(4);
+    // XOR decrypt
+    for (var i = 0; i < payload.length; i++) {
+      payload[i] ^= KRC_XOR_KEY[i % 16];
+    }
+    // zlib decompress
+    var textBytes = zlib.inflateSync(payload);
+    return textBytes.toString('utf8');
+  } catch (e) {
+    console.warn('[KRC Decode]', e.message);
+    return null;
+  }
+}
+
+// Convert KRC word-timing format to YRC + line-level LRC
+// KRC: [<startMs>,<durationMs>]<word1><startMs>,<durationMs><word2>...
+// YRC: [<startMs>,<durationMs>]<word1>(<startMs>,<durationMs>)<word2>(<startMs>,<durationMs>)...
+function krcToYrc(krcText) {
+  var lyricLines = [];
+  var yrcLines = [];
+  // Split into per-line entries: each line starts with [<ms>,<ms>]
+  var lineRe = /\[(\d+),(\d+)\]/g;
+  var lastIndex = 0;
+  var match;
+  while ((match = lineRe.exec(krcText)) !== null) {
+    var lineStart = parseInt(match[1], 10);
+    var lineDuration = parseInt(match[2], 10);
+    // Find the next line head or end of string
+    var contentStart = match.index + match[0].length;
+    var nextMatch;
+    lineRe.lastIndex = contentStart;
+    nextMatch = lineRe.exec(krcText);
+    var contentEnd = nextMatch ? nextMatch.index : krcText.length;
+    lineRe.lastIndex = contentStart; // reset for next iteration
+
+    var rawContent = krcText.slice(contentStart, contentEnd);
+    // Parse word-level timings: <startMs>,<durationMs>word<startMs>,<durationMs>word...
+    var wordRe = /<(\d+),(\d+)>/g;
+    var wordMatch;
+    var words = [];
+    var textPos = 0;
+    while ((wordMatch = wordRe.exec(rawContent)) !== null) {
+      var wStart = parseInt(wordMatch[1], 10);
+      var wDur = parseInt(wordMatch[2], 10);
+      // Text between previous word timing and this one
+      var wordText = rawContent.slice(textPos, wordMatch.index);
+      if (wordText) {
+        words.push({ t: wStart, d: wDur, text: wordText });
+      }
+      textPos = wordMatch.index + wordMatch[0].length;
+    }
+    // Remaining text after last word timing
+    var tailText = rawContent.slice(textPos);
+    if (tailText) {
+      words.push({ t: words.length ? (words[words.length - 1].t + words[words.length - 1].d) : lineStart, d: 0, text: tailText });
+    }
+
+    // Build YRC line: (<startMs>,<durationMs>,<offset0>)word...
+    var yrcParts = [];
+    var lineText = '';
+    for (var w = 0; w < words.length; w++) {
+      lineText += words[w].text;
+      yrcParts.push('(' + words[w].t + ',' + words[w].d + ',0)' + words[w].text);
+    }
+    if (!lineText) continue;
+
+    // Build LRC timestamp
+    var totalSec = lineStart / 1000;
+    var mins = Math.floor(totalSec / 60);
+    var secs = (totalSec % 60).toFixed(2);
+    var lrcTs = '[' + String(mins).padStart(2, '0') + ':' + (secs < 10 ? '0' : '') + secs + ']';
+
+    lyricLines.push(lrcTs + lineText);
+    yrcLines.push('[' + lineStart + ',' + lineDuration + ']' + yrcParts.join(''));
+  }
+  return {
+    lyric: lyricLines.join('\n'),
+    yrc: yrcLines.join('\n'),
+  };
+}
+
 async function kgGetLyric(hash, durationMs) {
   var songHash = String(hash || '').trim();
   if (!songHash) return { provider: 'kugou', error: 'Missing hash', lyric: '' };
@@ -3260,19 +3351,55 @@ async function kgGetLyric(hash, durationMs) {
     var dlResp = parseJSONText(dlText);
     var content = (dlResp && dlResp.content) || '';
     if (!content) return { provider: 'kugou', lyric: '', error: 'Empty lyric content' };
-    var contentType = Number(dlResp.contenttype || dlResp.content_type || 1);
+    var rawContentType = dlResp.contenttype ?? dlResp.content_type;
+    var contentType = (rawContentType !== undefined && rawContentType !== null) ? Number(rawContentType) : 1;
 
     try {
-      var decoded = Buffer.from(content, 'base64').toString('utf8');
-      // If it's LRC format (contentType=2), return directly
-      if (contentType === 2 || decoded.startsWith('[ti:') || decoded.startsWith('[ar:')) {
-        return { provider: 'kugou', lyric: decoded.replace(/\r\n/g, '\n'), source: 'kg-lrc' };
+      var bin = Buffer.from(content, 'base64');
+      // contentType 1 or 2 = LRC (plain text), check for LRC metadata headers
+      if (contentType === 1 || contentType === 2) {
+        var lrcText = bin.toString('utf8');
+        if (lrcText.startsWith('[ti:') || lrcText.startsWith('[ar:') || lrcText.startsWith('[by:') || lrcText.match(/\[\d{1,2}:\d{1,2}(?:\.\d{1,3})?\]/)) {
+          return { provider: 'kugou', lyric: lrcText.replace(/\r\n/g, '\n'), source: 'kg-lrc' };
+        }
       }
-      // KRC format — needs special decoder, return placeholder for now
-      if (decoded.includes('krc') || !decoded.match(/\[\d{2}:\d{2}/)) {
+      // contentType 0 = KRC encrypted format — decode and convert to YRC
+      if (contentType === 0) {
+        var krcText = decodeKrc(bin);
+        if (!krcText) return { provider: 'kugou', lyric: '', error: 'KRC decode failed', source: 'kg-krc-error' };
+        var result = krcToYrc(krcText);
+        return {
+          provider: 'kugou',
+          lyric: result.lyric,
+          yrc: result.yrc,
+          source: 'kg-krc',
+        };
+      }
+      // Unknown contentType — try to detect format
+      var unknownText = bin.toString('utf8');
+      // Check for KRC magic bytes
+      if (bin.length > 4 && bin[0] === 0x6b && bin[1] === 0x72 && bin[2] === 0x63 && bin[3] === 0x31) {
+        var krcText2 = decodeKrc(bin);
+        if (krcText2) {
+          var result2 = krcToYrc(krcText2);
+          return {
+            provider: 'kugou',
+            lyric: result2.lyric,
+            yrc: result2.yrc,
+            source: 'kg-krc',
+          };
+        }
+      }
+      // LRC detection with lenient regex (single-digit mm:ss allowed)
+      if (unknownText.match(/\[\d{1,2}:\d{1,2}(?:\.\d{1,3})?\]/) || unknownText.startsWith('[ti:') || unknownText.startsWith('[ar:')) {
+        return { provider: 'kugou', lyric: unknownText.replace(/\r\n/g, '\n'), source: 'kg-raw' };
+      }
+      // Binary content detection as last resort
+      if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(unknownText)) {
         return { provider: 'kugou', lyric: '', error: 'KRC encrypted lyrics not yet supported', source: 'kg-krc-unsupported' };
       }
-      return { provider: 'kugou', lyric: decoded.replace(/\r\n/g, '\n'), source: 'kg-raw' };
+      console.warn('[KGLyric] Unknown format, contentType=' + contentType + ', preview=' + unknownText.slice(0, 80));
+      return { provider: 'kugou', lyric: unknownText.replace(/\r\n/g, '\n'), source: 'kg-unknown' };
     } catch (e) {
       return { provider: 'kugou', lyric: '', error: 'Lyric decode failed: ' + e.message, source: 'kg-error' };
     }
