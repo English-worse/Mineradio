@@ -3277,8 +3277,8 @@ function decodeKrc(bin) {
 // Strip any remaining KRC/YRC coordinate markers from plain text
 function stripLyricCoordinates(text) {
   return String(text || '')
-    .replace(/<(\d+),(\d+)>/g, '')     // KRC word timings <ms,ms>
-    .replace(/\((\d+),(\d+),\d+\)/g, '') // YRC word timings (ms,ms,offset)
+    .replace(/<\d+,\d+(?:,\d+)?>/g, '')   // KRC word timings <ms,ms> or <ms,ms,idx>
+    .replace(/\(\d+,\d+,\d+\)/g, '')       // YRC word timings (ms,ms,offset)
     .replace(/\s+/g, ' ').trim();
 }
 
@@ -3300,9 +3300,8 @@ function krcToYrc(krcText) {
     var body = hdrMatch[3] || '';
     if (!body) continue;
 
-    // Parse word-level timings: <startMs,durMs>word<startMs,durMs>word...
-    // First word (before first timing tag) belongs to line start
-    var wordRe = /<(\d+),(\d+)>/g;
+    // Parse word-level timings: <startMs,durMs,idx>word... (KRC uses 2 or 3 params)
+    var wordRe = /<(\d+),(\d+)(?:,\d+)?>/g;
     var words = [];
     var textPos = 0;
     var wm;
@@ -3607,19 +3606,8 @@ function mapKGPlaylistTrack(item) {
 }
 
 async function kgFetchPlaylistDetail(id) {
-  // Try mobile API first (no auth needed for public playlists)
-  var u = KG_PLAYLIST_DETAIL_URL + '?specialid=' + encodeURIComponent(id) + '&page=1&pagesize=300&version=9108&area_code=1';
-  var text = await kgRequest(u, { headers: { ...KG_MOBILE_HEADERS } });
-  var resp = parseJSONText(text);
-  // Try multiple response structures (mobile API varies)
-  var info = (resp && resp.data && resp.data.info) || (resp && resp.info) || (resp && resp.data) || [];
-  if (!Array.isArray(info)) info = (info.list || info.songs || []);
-  if (!Array.isArray(info)) info = [];
-  var tracks = info.map(mapKGPlaylistTrack).filter(Boolean);
-  tracks.reverse(); // newest first
-
-  // Fallback: if mobile API returned empty and user has app cookie, try gateway
-  if (!tracks.length && kgHasAppCookie(kgCookieObject())) {
+  // If user has app cookie, prefer gateway API (more reliable)
+  if (kgHasAppCookie(kgCookieObject())) {
     try {
       var cookieObj = kgCookieObject();
       var userId = kgCookieUserId(cookieObj);
@@ -3643,13 +3631,22 @@ async function kgFetchPlaylistDetail(id) {
       if (Array.isArray(gwInfo) && gwInfo.length) {
         var gwTracks = gwInfo.map(mapKGPlaylistTrack).filter(Boolean);
         gwTracks.reverse();
-        if (gwTracks.length > tracks.length) tracks = gwTracks;
+        return { provider: 'kugou', id: id, tracks: gwTracks, total: gwTracks.length };
       }
     } catch (e) {
-      console.warn('[KGFetchPlaylistDetail] gateway fallback failed:', e.message);
+      console.warn('[KGFetchPlaylistDetail] gateway primary failed:', e.message);
     }
   }
 
+  // Fallback: mobile API (no auth, works for public playlists)
+  var u = KG_PLAYLIST_DETAIL_URL + '?specialid=' + encodeURIComponent(id) + '&page=1&pagesize=300&version=9108&area_code=1';
+  var text = await kgRequest(u, { headers: { ...KG_MOBILE_HEADERS } });
+  var resp = parseJSONText(text);
+  var info = (resp && resp.data && resp.data.info) || (resp && resp.info) || (resp && resp.data) || [];
+  if (!Array.isArray(info)) info = (info.list || info.songs || []);
+  if (!Array.isArray(info)) info = [];
+  var tracks = info.map(mapKGPlaylistTrack).filter(Boolean);
+  tracks.reverse();
   return { provider: 'kugou', id: id, tracks: tracks, total: tracks.length };
 }
 
