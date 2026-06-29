@@ -51,6 +51,8 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const tls = require('tls');
+const os = require('os');
+
 const { once } = require('events');
 const { fileURLToPath } = require('url');
 const { analyzePodcastDjStream, analyzePodcastDjIntro } = require('./dj-analyzer');
@@ -1787,31 +1789,41 @@ const KG_GATEWAY_HEADERS_COMMON = { 'kg-rc': '1', 'kg-thash': '5d816a0', 'kg-rec
 
 function requestText(targetUrl, opts, body) {
   opts = opts || {};
+  var maxRedirects = (opts.maxRedirects !== undefined) ? opts.maxRedirects : 5;
   return new Promise((resolve, reject) => {
-    const u = new URL(targetUrl);
-    const lib = u.protocol === 'https:' ? https : http;
-    const req = lib.request(u, {
-      method: opts.method || 'GET',
-      headers: opts.headers || {},
-    }, response => {
-      const chunks = [];
-      response.on('data', chunk => chunks.push(chunk));
-      response.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf8');
-        if (response.statusCode >= 400) {
-          const err = new Error('HTTP ' + response.statusCode);
-          err.statusCode = response.statusCode;
-          err.body = text;
-          reject(err);
+    function doRequest(urlStr, redirectsLeft) {
+      const u = new URL(urlStr);
+      const lib = u.protocol === 'https:' ? https : http;
+      const req = lib.request(u, {
+        method: opts.method || 'GET',
+        headers: opts.headers || {},
+      }, response => {
+        // Follow redirects
+        if (response.statusCode >= 301 && response.statusCode <= 308 && response.headers.location && redirectsLeft > 0) {
+          const redirectUrl = new URL(response.headers.location, u).toString();
+          doRequest(redirectUrl, redirectsLeft - 1);
           return;
         }
-        resolve(text);
+        const chunks = [];
+        response.on('data', chunk => chunks.push(chunk));
+        response.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (response.statusCode >= 400) {
+            const err = new Error('HTTP ' + response.statusCode);
+            err.statusCode = response.statusCode;
+            err.body = text;
+            reject(err);
+            return;
+          }
+          resolve(text);
+        });
       });
-    });
-    req.setTimeout(10000, () => req.destroy(new Error('Request timeout')));
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
+      req.setTimeout(10000, () => req.destroy(new Error('Request timeout')));
+      req.on('error', reject);
+      if (body) req.write(body);
+      req.end();
+    }
+    doRequest(targetUrl, maxRedirects);
   });
 }
 
@@ -2284,7 +2296,10 @@ async function buildWeatherRadio(params) {
 
 function parseJSONText(text) {
   const raw = String(text || '').trim();
-  const json = raw.replace(/^callback\(([\s\S]*)\);?$/, '$1');
+  // Handle JSONP callbacks: callback(...), jQuery1234(...), kgJSONP(...), etc.
+  var json = raw.replace(/^[\w$.]*\(([\s\S]*)\);?\s*$/, '$1');
+  // If that didn't match, try plain JSON
+  if (json === raw) json = raw;
   return JSON.parse(json);
 }
 
@@ -3362,32 +3377,59 @@ async function kgGetLyric(hash, durationMs) {
     if (!candidates.length) return { provider: 'kugou', lyric: '', error: 'Lyric not found' };
 
     var c = candidates[0];
-    var dlUrl = KG_LYRIC_DOWNLOAD_URL + '?ver=1&client=pc&id=' + encodeURIComponent(c.id) + '&accesskey=' + encodeURIComponent(c.accesskey) + '&fmt=krc&charset=utf8';
-    var dlText = await kgRequest(dlUrl, { headers: { ...KG_MOBILE_HEADERS } });
-    var dlResp = parseJSONText(dlText);
-    var content = (dlResp && dlResp.content) || '';
-    if (!content) return { provider: 'kugou', lyric: '', error: 'Empty lyric content' };
-    var rawContentType = dlResp.contenttype ?? dlResp.content_type;
-    var contentType = (rawContentType !== undefined && rawContentType !== null) ? Number(rawContentType) : 1;
+    var accesskey = encodeURIComponent(c.accesskey);
+    var id = encodeURIComponent(c.id);
 
+    // Try LRC first (plain text, no decoding needed, works for all languages)
     try {
-      var bin = Buffer.from(content, 'base64');
+      var lrcUrl = KG_LYRIC_DOWNLOAD_URL + '?ver=1&client=pc&id=' + id + '&accesskey=' + accesskey + '&fmt=lrc&charset=utf8';
+      var lrcText = await kgRequest(lrcUrl, { headers: { ...KG_MOBILE_HEADERS } });
+      var lrcResp = parseJSONText(lrcText);
+      var lrcContent = (lrcResp && lrcResp.content) || '';
+      if (lrcContent) {
+        var lrcBin = Buffer.from(lrcContent, 'base64');
+        var lrcStr = lrcBin.toString('utf8');
+        // Validate it's actually LRC (has [mm:ss] timestamps or metadata headers)
+        if (lrcStr.match(/\[\d{1,2}:\d{1,2}(?:\.\d{1,3})?\]/) || lrcStr.startsWith('[ti:') || lrcStr.startsWith('[ar:') || lrcStr.startsWith('[by:')) {
+          return { provider: 'kugou', lyric: lrcStr.replace(/\r\n/g, '\n'), source: 'kg-lrc' };
+        }
+        // If it doesn't look like LRC, it might be plain text lyrics without timestamps
+        if (lrcStr.trim().length > 10 && !/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(lrcStr)) {
+          return { provider: 'kugou', lyric: lrcStr.replace(/\r\n/g, '\n'), source: 'kg-lrc-plain' };
+        }
+      }
+    } catch (e) {
+      console.warn('[KGLyric] LRC fetch failed:', e.message);
+    }
+
+    // Fallback: try KRC for word-level karaoke timing
+    try {
+      var krcUrl = KG_LYRIC_DOWNLOAD_URL + '?ver=1&client=pc&id=' + id + '&accesskey=' + accesskey + '&fmt=krc&charset=utf8';
+      var krcText = await kgRequest(krcUrl, { headers: { ...KG_MOBILE_HEADERS } });
+      var krcResp = parseJSONText(krcText);
+      var krcContent = (krcResp && krcResp.content) || '';
+      if (!krcContent) return { provider: 'kugou', lyric: '', error: 'Empty lyric content' };
+      var rawContentType = krcResp.contenttype ?? krcResp.content_type;
+      var contentType = (rawContentType !== undefined && rawContentType !== null) ? Number(rawContentType) : 1;
+
+      var bin = Buffer.from(krcContent, 'base64');
 
       // contentType 0 = KRC encrypted binary — decode and convert
       if (contentType === 0) {
-        var krcText = decodeKrc(bin);
-        if (!krcText) return { provider: 'kugou', lyric: '', error: 'KRC decode failed', source: 'kg-krc-error' };
-        var result = krcToYrc(krcText);
-        return { provider: 'kugou', lyric: result.lyric, yrc: result.yrc, source: 'kg-krc' };
+        var krcDecoded = decodeKrc(bin);
+        if (!krcDecoded) return { provider: 'kugou', lyric: '', error: 'KRC decode failed', source: 'kg-krc-error' };
+        var result = krcToYrc(krcDecoded);
+        if (result.lyric || result.yrc) {
+          return { provider: 'kugou', lyric: result.lyric, yrc: result.yrc, source: 'kg-krc' };
+        }
+        return { provider: 'kugou', lyric: '', error: 'KRC produced empty lyrics', source: 'kg-krc-empty' };
       }
 
-      // Decode as text for all other content types
-      var text = bin.toString('utf8');
+      var plainText = bin.toString('utf8');
 
       // KRC text detection (KuGou often mislabels KRC as contentType 1 or 2)
-      // KRC text has [ms,ms] line headers with comma separator
-      if (looksLikeKrc(text)) {
-        var krcResult = krcToYrc(text);
+      if (looksLikeKrc(plainText)) {
+        var krcResult = krcToYrc(plainText);
         if (krcResult.lyric || krcResult.yrc) {
           return { provider: 'kugou', lyric: krcResult.lyric, yrc: krcResult.yrc, source: 'kg-krc-text' };
         }
@@ -3405,20 +3447,20 @@ async function kgGetLyric(hash, durationMs) {
       }
 
       // LRC detection: standard [mm:ss.xx] or metadata headers
-      if (text.match(/\[\d{1,2}:\d{1,2}(?:\.\d{1,3})?\]/) || text.startsWith('[ti:') || text.startsWith('[ar:') || text.startsWith('[by:')) {
-        return { provider: 'kugou', lyric: text.replace(/\r\n/g, '\n'), source: 'kg-lrc' };
+      if (plainText.match(/\[\d{1,2}:\d{1,2}(?:\.\d{1,3})?\]/) || plainText.startsWith('[ti:') || plainText.startsWith('[ar:') || plainText.startsWith('[by:')) {
+        return { provider: 'kugou', lyric: plainText.replace(/\r\n/g, '\n'), source: 'kg-lrc' };
       }
 
-      // Binary content as last resort
-      if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(text)) {
+      // Binary content as last resort — can't use
+      if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(plainText)) {
         return { provider: 'kugou', lyric: '', error: 'Binary/encrypted lyrics unsupported', source: 'kg-binary' };
       }
 
-      // Unknown format — return sanitized (strip any timing markers just in case)
-      console.warn('[KGLyric] Unknown format, contentType=' + contentType + ', preview=' + text.slice(0, 80));
+      // Unknown format — return empty (client will show fallback)
+      console.warn('[KGLyric] Unknown format, contentType=' + contentType + ', preview=' + plainText.slice(0, 80));
       return { provider: 'kugou', lyric: '', error: 'Unknown lyric format', source: 'kg-unknown' };
     } catch (e) {
-      return { provider: 'kugou', lyric: '', error: 'Lyric decode failed: ' + e.message, source: 'kg-error' };
+      return { provider: 'kugou', lyric: '', error: 'KRC decode failed: ' + e.message, source: 'kg-error' };
     }
   } catch (e) {
     console.warn('[KGLyric]', e.message);
@@ -3570,16 +3612,16 @@ async function kgGetUserPlaylists() {
 // ============ 酷狗歌单详情/曲目 ============
 function mapKGPlaylistTrack(item) {
   // Try all hash variants, preferring longer ones (SQ > HQ > 320 > 128)
-  var finalHash = item.SQFileHash || item.HQFileHash || item.hash || item.FileHash || '';
+  var finalHash = item.SQFileHash || item.HQFileHash || item.hash || item.FileHash || item.filehash || item.songhash || '';
   if (item.trans_param && item.trans_param.ogg_320_hash) finalHash = finalHash || item.trans_param.ogg_320_hash;
   if (item.trans_param && item.trans_param.ogg_128_hash) finalHash = finalHash || item.trans_param.ogg_128_hash;
-  if (!isValidHash(finalHash)) finalHash = (item.hash || item.FileHash || ''); // fallback to any hash
+  if (!isValidHash(finalHash)) finalHash = (item.hash || item.FileHash || item.filehash || item.songhash || ''); // fallback to any hash
   if (!finalHash || finalHash.length < 16) return null;
-  var duration = kgNormalizeDuration(item.duration || item.timelength || 0);
-  var filesize = item.filesize || item.SQFileSize || item.HQFileSize || item.FileSize || 0;
+  var duration = kgNormalizeDuration(item.duration || item.timelength || item.Duration || 0);
+  var filesize = item.filesize || item.SQFileSize || item.HQFileSize || item.FileSize || item.file_size || 0;
   var bitrate = duration > 0 && filesize > 0 ? Math.round(filesize * 8 / 1000 / duration) : 0;
-  var name = item.songname || item.name || item.filename || '';
-  var artist = item.singername || item.artist || '';
+  var name = item.songname || item.name || item.filename || item.song_name || item.SongName || '';
+  var artist = item.singername || item.artist || item.singer_name || item.SingerName || '';
   if (!name && item.filename) {
     var parts = item.filename.split(' - ');
     if (parts.length >= 2) { artist = parts[0].trim(); name = parts.slice(1).join(' - ').trim(); }
@@ -3589,7 +3631,7 @@ function mapKGPlaylistTrack(item) {
     provider: 'kugou', source: 'kugou', type: 'kugou',
     id: finalHash, kgHash: finalHash,
     kgSQHash: item.SQFileHash || '', kgHQHash: item.HQFileHash || '',
-    kgFileHash: item.FileHash || '', kgResHash: item.ResFileHash || '',
+    kgFileHash: item.FileHash || item.filehash || '', kgResHash: item.ResFileHash || '',
     kgOgg320Hash: (item.trans_param && item.trans_param.ogg_320_hash) || '',
     kgOgg128Hash: (item.trans_param && item.trans_param.ogg_128_hash) || '',
     kgAlbumId: String(item.AlbumID || item.album_id || item.AlbumIDLegacy || ''),
@@ -3599,7 +3641,7 @@ function mapKGPlaylistTrack(item) {
     kgFileSize: filesize,
     name: name, artist: artist,
     artists: artist ? [{ name: artist }] : [],
-    album: item.album_name || item.album || '', cover: kgCoverUrl(item.trans_param && item.trans_param.union_cover || ''),
+    album: item.album_name || item.album || item.AlbumName || '', cover: kgCoverUrl(item.trans_param && item.trans_param.union_cover || ''),
     duration: duration * 1000, fee: item.Privilege >= 8 ? 1 : 0, playable: false,
     link: 'https://www.kugou.com/song/#hash=' + finalHash,
   };
@@ -3614,8 +3656,9 @@ async function kgFetchPlaylistDetail(id) {
       var mid = kgCookieMid(cookieObj);
       var dfid = kgCookieDfid(cookieObj);
       var clienttime = String(Math.floor(Date.now() / 1000));
+      var numId = parseInt(id, 10) || id;
       var gwData = JSON.stringify({
-        specialid: parseInt(id, 10) || id, userid: userId,
+        specialid: numId, userid: userId,
         area_code: 1, show_relate_goods: 0, page: 1, pagesize: 300,
         token: kgCookieToken(cookieObj), type: 0, allplatform: 1,
       });
@@ -3624,34 +3667,99 @@ async function kgFetchPlaylistDetail(id) {
         appid: KG_LITE_APP_ID, clientver: KG_LITE_VER, clienttime: clienttime,
         token: kgCookieToken(cookieObj), userid: userId,
       };
-      var gwResp = await kgAndroidPost(KG_GATEWAY_PLAYLIST_URL.replace('get_all_list', 'get_special_detail'), gwParams, gwData, {
-        headers: { 'x-router': 'special.service.kugou.com' }
-      });
-      var gwInfo = (gwResp && gwResp.data && gwResp.data.info) || [];
-      if (Array.isArray(gwInfo) && gwInfo.length) {
-        var gwTracks = gwInfo.map(mapKGPlaylistTrack).filter(Boolean);
-        gwTracks.reverse();
-        return { provider: 'kugou', id: id, tracks: gwTracks, total: gwTracks.length };
+      // Try multiple gateway endpoint variants
+      var gwEndpoints = [
+        { url: KG_GATEWAY_PLAYLIST_URL.replace('get_all_list', 'get_special_detail'), router: 'special.service.kugou.com' },
+        { url: KG_GATEWAY_PLAYLIST_URL.replace('get_all_list', 'get_special_info'), router: 'special.service.kugou.com' },
+        { url: KG_GATEWAY_PLAYLIST_URL.replace('get_all_list', 'get_plist_song'), router: 'plistsong.service.kugou.com' },
+      ];
+      var gwTracks = null;
+      for (var gi = 0; gi < gwEndpoints.length; gi++) {
+        try {
+          var gwe = gwEndpoints[gi];
+          var gwResp = await kgAndroidPost(gwe.url, gwParams, gwData, {
+            headers: { 'x-router': gwe.router }
+          });
+          var gwInfo = (gwResp && gwResp.data && gwResp.data.info) || [];
+          if (Array.isArray(gwInfo) && gwInfo.length) {
+            gwTracks = gwInfo.map(mapKGPlaylistTrack).filter(Boolean);
+            if (gwTracks.length) { gwTracks.reverse(); return { provider: 'kugou', id: id, tracks: gwTracks, total: gwTracks.length }; }
+          }
+          // Try alternative paths
+          var gwAlt = (gwResp && gwResp.data && gwResp.data.list) || (gwResp && gwResp.data && gwResp.data.songs) || (gwResp && gwResp.data && gwResp.data.tracks) || [];
+          if (Array.isArray(gwAlt) && gwAlt.length) {
+            gwTracks = gwAlt.map(mapKGPlaylistTrack).filter(Boolean);
+            if (gwTracks.length) { gwTracks.reverse(); return { provider: 'kugou', id: id, tracks: gwTracks, total: gwTracks.length }; }
+          }
+        } catch (e) {
+        }
       }
     } catch (e) {
       console.warn('[KGFetchPlaylistDetail] gateway primary failed:', e.message);
     }
   }
 
-  // Fallback: mobile API (no auth, works for public playlists)
-  var u = KG_PLAYLIST_DETAIL_URL + '?specialid=' + encodeURIComponent(id) + '&page=1&pagesize=300&version=9108&area_code=1';
-  var text = await kgRequest(u, { headers: { ...KG_MOBILE_HEADERS } });
-  var resp = parseJSONText(text);
-  var info = (resp && resp.data && resp.data.info) || (resp && resp.info) || (resp && resp.data) || [];
-  if (!Array.isArray(info)) info = (info.list || info.songs || []);
-  if (!Array.isArray(info)) info = [];
-  var tracks = info.map(mapKGPlaylistTrack).filter(Boolean);
-  tracks.reverse();
-  return { provider: 'kugou', id: id, tracks: tracks, total: tracks.length };
+  // Fallback: try multiple mobile/web API endpoints
+  var endpoints = [
+    // m.kugou.com — same domain that works for user playlist listing
+    {
+      name: 'm.kugou.com',
+      url: 'http://m.kugou.com/special/single/' + encodeURIComponent(id) + '?json=true',
+      parse: function(text) {
+        var d = parseJSONText(text);
+        // m.kugou.com returns { list: [...] } or { songs: { list: [...] } }
+        var list = (d && d.list) || (d && d.songs && d.songs.list) || [];
+        if (!Array.isArray(list) && d && d.data) list = d.data.list || d.data.info || [];
+        return Array.isArray(list) ? list : [];
+      }
+    },
+    // mobilecdn API with different version params
+    {
+      name: 'mobilecdn',
+      url: 'http://mobilecdn.kugou.com/api/v3/special/song?specialid=' + encodeURIComponent(id) + '&page=1&pagesize=300&version=9108&area_code=1&plat=0&format=json',
+      parse: function(text) {
+        var d = parseJSONText(text);
+        var info = (d && d.data && d.data.info) || (d && d.info) || (d && d.data) || [];
+        if (!Array.isArray(info)) info = (info.list || info.songs || info.tracks || []);
+        return Array.isArray(info) ? info : [];
+      }
+    },
+    // mobilecdn try HTTPS variant
+    {
+      name: 'mobilecdn-https',
+      url: 'https://mobilecdn.kugou.com/api/v3/special/song?specialid=' + encodeURIComponent(id) + '&page=1&pagesize=300&version=9108&area_code=1&plat=0&format=json',
+      parse: function(text) {
+        var d = parseJSONText(text);
+        var info = (d && d.data && d.data.info) || (d && d.info) || (d && d.data) || [];
+        if (!Array.isArray(info)) info = (info.list || info.songs || info.tracks || []);
+        return Array.isArray(info) ? info : [];
+      }
+    },
+  ];
+
+  for (var ei = 0; ei < endpoints.length; ei++) {
+    var ep = endpoints[ei];
+    try {
+      console.log('[KGPlaylistDetail] trying endpoint:', ep.name);
+      var text = await kgRequest(ep.url, { headers: { ...KG_MOBILE_HEADERS } });
+      var items = ep.parse(text);
+      if (items.length) {
+        var firstKeys = Object.keys(items[0] || {}).slice(0, 20);
+        var firstSample = JSON.stringify(items[0]).slice(0, 400);
+        var tracks = items.map(mapKGPlaylistTrack).filter(Boolean);
+        if (tracks.length) {
+          tracks.reverse();
+          return { provider: 'kugou', id: id, tracks: tracks, total: tracks.length };
+        }
+      }
+    } catch (e) {
+    }
+  }
+
+  return { provider: 'kugou', id: id, tracks: [], total: 0, error: 'All endpoints exhausted' };
 }
 
 async function kgGetPlaylistTracks(id) {
-  if (!id) return { provider: 'kugou', error: 'Missing playlist id', tracks: [] };
   // Check if it's a cloudlist ID
   if (String(id).startsWith('cloudlist:')) {
     var listID = String(id).replace('cloudlist:', '');

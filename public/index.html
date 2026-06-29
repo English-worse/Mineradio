@@ -13034,7 +13034,7 @@ function makeShelfManager() {
         var provider = pl.provider === 'qq' ? 'qq' : (pl.provider === 'kugou' ? 'kugou' : 'netease');
         var sourceLabel = provider === 'qq' ? 'QQ' : 'NE';
         return { type:'playlist', title: pl.name, sub:sourceLabel + ' · ' + (pl.trackCount||0)+' 首 · 播放 '+compactCount(pl.playCount||0),
-          cover: pl.cover || '', tag: pl.subscribed ? '收藏歌单' : '我的歌单', playlistId: (provider === 'qq' ? 'qq:' : '') + pl.id, provider: provider };
+          cover: pl.cover || '', tag: pl.subscribed ? '收藏歌单' : '我的歌单', playlistId: (provider === 'qq' ? 'qq:' : (provider === 'kugou' ? 'kg:' : '')) + pl.id, provider: provider };
       });
       if (shelfShowsPodcasts() && (shelfPane === 'mine' || shelfMergesCollections()) && myPodcastCollections.length) {
         myPodcastCollections.forEach(function(pc){
@@ -19668,12 +19668,14 @@ async function openPlaylistPanelDetail(provider, pid, title) {
   playlistPanelDetailState = { key: key, loading: true, playlist: pl, tracks: [], token: token, renderLimit: PLAYLIST_DETAIL_INITIAL_RENDER };
   renderPlaylistPanelDetailState();
   scrollPlaylistPanelDetailIntoView(key);
+  var endpoint = provider === 'qq'
+    ? '/api/qq/playlist/tracks?id=' + encodeURIComponent(pid)
+    : (provider === 'kugou'
+      ? '/api/kg/playlist/tracks?id=' + encodeURIComponent(pid)
+      : '/api/playlist/tracks?id=' + encodeURIComponent(pid));
+
   try {
-    var r = provider === 'qq'
-      ? await apiJson('/api/qq/playlist/tracks?id=' + encodeURIComponent(pid))
-      : (provider === 'kugou'
-        ? await apiJson('/api/kg/playlist/tracks?id=' + encodeURIComponent(pid))
-        : await apiJson('/api/playlist/tracks?id=' + encodeURIComponent(pid)));
+    var r = await apiJson(endpoint);
     if (playlistPanelDetailState.token !== token) return;
     playlistPanelDetailState.loading = false;
     playlistPanelDetailState.tracks = (r && r.tracks || []).map(cloneSong);
@@ -19822,6 +19824,7 @@ function renderMyPodcastCollections(opts) {
   }).join('');
   if (opts.animate) animateVisiblePanelList($pod, '.pl-card', document.getElementById('playlist-panel'));
 }
+// Handle playlist card clicks via document-level delegation (more reliable)
 document.getElementById('pl-list').addEventListener('click', function(e){
   var loadMore = e.target && e.target.closest ? e.target.closest('[data-pl-load-more]') : null;
   if (loadMore) {
@@ -19969,6 +19972,7 @@ async function loadPlaylistIntoQueueById(id, autoplay, title) {
   showLoading();
   var qqPlaylistId = String(id || '').indexOf('qq:') === 0 ? String(id).slice(3) : '';
   var kgPlaylistId = String(id || '').indexOf('kg:') === 0 ? String(id).slice(3) : '';
+
   var r = null;
   try {
     r = qqPlaylistId
@@ -19976,7 +19980,9 @@ async function loadPlaylistIntoQueueById(id, autoplay, title) {
       : (kgPlaylistId
         ? await apiJson('/api/kg/playlist/tracks?id=' + encodeURIComponent(kgPlaylistId))
         : await apiJson('/api/playlist/tracks?id=' + encodeURIComponent(id)));
+
   } catch (e) {
+
     console.warn('[PlaylistLoadApi]', id, e);
     showToast('歌单加载失败');
     hideLoading();
