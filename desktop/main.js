@@ -36,6 +36,8 @@ const NETEASE_LOGIN_PARTITION = 'persist:mineradio-netease-login';
 const NETEASE_LOGIN_URL = 'https://music.163.com/#/login';
 const QQ_LOGIN_PARTITION = 'persist:mineradio-qqmusic-login';
 const QQ_LOGIN_URL = 'https://y.qq.com/n/ryqq/profile';
+const KG_LOGIN_PARTITION = 'persist:mineradio-kugou-login';
+const KG_LOGIN_URL = 'https://www.kugou.com/';
 
 const CHROMIUM_PERFORMANCE_SWITCHES = [
   ['autoplay-policy', 'no-user-gesture-required'],
@@ -88,6 +90,21 @@ const NETEASE_LOGIN_COOKIE_PRIORITY = [
   'WEVNSM',
   'WNMCID',
   'JSESSIONID-WYYY',
+];
+const KG_LOGIN_COOKIE_PRIORITY = [
+  'kg_mid',
+  'kg_dfid',
+  'kg_dfid_collect',
+  'userid',
+  'token',
+  'kg_token',
+  'sessionid',
+  'nickname',
+  'headimg',
+  'user_name',
+  'kg_login_type',
+  'kg_vip_type',
+  'kg_vip_level',
 ];
 
 function findOpenPort(startPort) {
@@ -360,6 +377,22 @@ function isNeteaseCookieDomain(domain) {
     normalized === 'music.163.com' || normalized.endsWith('.music.163.com') ||
     normalized === 'netease.com' || normalized.endsWith('.netease.com');
 }
+function isKugouCookieDomain(domain) {
+  const normalized = String(domain || '').replace(/^\./, '').toLowerCase();
+  return normalized === 'kugou.com' || normalized.endsWith('.kugou.com') ||
+    normalized === 'kugou.net' || normalized.endsWith('.kugou.net');
+}
+function kugouCookieHasLogin(cookieText) {
+  const obj = parseCookieHeader(cookieText);
+  const userId = obj.userid || obj.kg_userid || obj.user_id || obj.kg_uid || obj.uid || obj.P_INFO || obj.user || '';
+  const token = obj.token || obj.kg_token || obj.sessionid || obj.kg_sessionid || obj.sessdata || obj.P_Cookie || obj.p_cookie || '';
+  const kgMid = obj.kg_mid || obj.mid || '';
+  const hasUserId = !!userId;
+  const hasToken = !!token;
+  const hasMid = !!kgMid;
+  const signals = [hasUserId, hasToken, hasMid].filter(Boolean).length;
+  return signals >= 2;
+}
 
 function buildCookieHeaderFor(cookies, isAllowedDomain, priority) {
   const picked = new Map();
@@ -610,6 +643,170 @@ async function clearQQMusicLoginSession() {
 
 async function clearNeteaseMusicLoginSession() {
   const cookieSession = session.fromPartition(NETEASE_LOGIN_PARTITION);
+  await cookieSession.clearStorageData({
+    storages: ['cookies', 'localstorage', 'indexdb', 'cachestorage'],
+  });
+  return { ok: true };
+}
+
+async function readKugouLoginCookieHeader(cookieSession) {
+  const cookies = await cookieSession.cookies.get({});
+  return buildCookieHeaderFor(cookies, isKugouCookieDomain, KG_LOGIN_COOKIE_PRIORITY);
+}
+
+async function openKugouMusicLoginWindow(owner) {
+  const cookieSession = session.fromPartition(KG_LOGIN_PARTITION);
+  const initialCookie = await readKugouLoginCookieHeader(cookieSession);
+  if (kugouCookieHasLogin(initialCookie)) return { ok: true, cookie: initialCookie, reused: true };
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let pollTimer = null;
+
+    const loginWindow = new BrowserWindow({
+      width: 900,
+      height: 720,
+      minWidth: 760,
+      minHeight: 560,
+      parent: owner && !owner.isDestroyed() ? owner : undefined,
+      modal: false,
+      show: false,
+      autoHideMenuBar: true,
+      title: '酷狗音乐登录',
+      backgroundColor: '#111111',
+      icon: APP_ICON_ICO,
+      webPreferences: {
+        partition: KG_LOGIN_PARTITION,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    // Set Chrome UA to avoid being blocked by Kugou
+    loginWindow.webContents.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    const finish = async (result) => {
+      if (settled) return;
+      settled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      if (loginWindow && !loginWindow.isDestroyed()) {
+        loginWindow.close();
+      }
+      resolve(result);
+    };
+
+    let kgPollCount = 0;
+    const checkCookies = async () => {
+      try {
+        kgPollCount++;
+        const cookie = await readKugouLoginCookieHeader(cookieSession);
+        const hasLogin = kugouCookieHasLogin(cookie);
+        if (kgPollCount <= 3 || hasLogin) {
+          console.log('[KugouLogin] poll #' + kgPollCount, 'cookieLen:', cookie.length, 'hasLogin:', hasLogin);
+        }
+        if (hasLogin) {
+          finish({ ok: true, cookie });
+          return true;
+        }
+        return false;
+      } catch (e) {
+        console.warn('Kugou login cookie check failed:', e.message);
+        return false;
+      }
+    };
+
+    loginWindow.webContents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:\/\/([^/]+\.)?kugou\.(com|net)/i.test(url)) {
+        loginWindow.loadURL(url).catch((e) => console.warn('Kugou login popup navigation failed:', e.message));
+      } else if (/^https?:\/\//i.test(url)) {
+        shell.openExternal(url).catch(() => {});
+      }
+      return { action: 'deny' };
+    });
+
+    loginWindow.webContents.on('did-finish-load', async () => {
+      const found = await checkCookies();
+      if (!found && !settled) {
+        // Try to detect login by checking page content
+        loginWindow.webContents.executeJavaScript(`
+          (function(){
+            // Check for user info in DOM (indicates logged in)
+            var body = document.body && document.body.innerText || '';
+            // Look for common logged-in indicators
+            var hasNickname = /昵称|用户名|账号管理|我的音乐|会员中心|VIP/.test(body);
+            var hasLogout = /退出|注销|退出登录/.test(body);
+            var userEl = document.querySelector('.user_name,.nickname,.header_name,[class*="user"],[class*="nick"]');
+            var userName = userEl ? userEl.textContent.trim() : '';
+            return JSON.stringify({
+              url: location.href,
+              title: document.title,
+              hasNickname: hasNickname,
+              hasLogout: hasLogout,
+              userName: userName.slice(0, 40),
+              cookieCount: document.cookie.split(';').length,
+              bodyLen: body.length
+            });
+          })()
+        `, true).then((result) => {
+          try {
+            var info = JSON.parse(result || '{}');
+            console.log('[KugouLogin] page info:', JSON.stringify(info));
+            if (info.hasLogout || info.userName || info.hasNickname) {
+              console.log('[KugouLogin] page indicates logged-in state, forcing cookie re-read');
+              checkCookies();
+            }
+          } catch (e) {}
+        }).catch(() => {});
+
+        // Click login button if on login page
+        loginWindow.webContents.executeJavaScript(`
+          setTimeout(() => {
+            const nodes = Array.from(document.querySelectorAll('a, button, span, div'));
+            const loginNode = nodes.find((node) => {
+              const text = (node.textContent || '').trim();
+              if (!/登录|登陆/.test(text)) return false;
+              const rect = node.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            });
+            if (loginNode) loginNode.click();
+          }, 700);
+        `, true).catch(() => {});
+      }
+    });
+
+    loginWindow.on('ready-to-show', () => loginWindow.show());
+    loginWindow.on('closed', async () => {
+      if (settled) return;
+      if (pollTimer) clearInterval(pollTimer);
+      try {
+        const allCookies = await cookieSession.cookies.get({});
+        console.log('[KugouLogin] window closed, total cookies:', allCookies.length);
+        const cookieNames = allCookies.map(c => c.name + (c.domain ? '@' + c.domain : '')).join(', ');
+        console.log('[KugouLogin] cookie names:', cookieNames.slice(0, 400));
+        const cookieHeader = await readKugouLoginCookieHeader(cookieSession);
+        console.log('[KugouLogin] cookie header length:', cookieHeader.length);
+        const hasLogin = kugouCookieHasLogin(cookieHeader);
+        console.log('[KugouLogin] hasLogin:', hasLogin);
+        // Always return cookies if we have any — server will determine if they're useful
+        if (cookieHeader && cookieHeader.length > 20) {
+          console.log('[KugouLogin] returning cookie header anyway (len=' + cookieHeader.length + ')');
+          resolve({ ok: true, cookie: cookieHeader, partial: !hasLogin });
+        } else {
+          resolve({ ok: false, cancelled: true, message: '酷狗登录窗口已关闭，未获取到会话' });
+        }
+      } catch (e) {
+        console.error('[KugouLogin] closed handler error:', e.message);
+        resolve({ ok: false, error: e.message || '酷狗登录窗口已关闭' });
+      }
+    });
+
+    pollTimer = setInterval(checkCookies, 1200);
+    loginWindow.loadURL(KG_LOGIN_URL).catch((e) => finish({ ok: false, error: e.message }));
+  });
+}
+
+async function clearKugouMusicLoginSession() {
+  const cookieSession = session.fromPartition(KG_LOGIN_PARTITION);
   await cookieSession.clearStorageData({
     storages: ['cookies', 'localstorage', 'indexdb', 'cachestorage'],
   });
@@ -1176,6 +1373,14 @@ ipcMain.handle('qq-music-clear-login', async () => {
   return clearQQMusicLoginSession();
 });
 
+ipcMain.handle('kugou-music-open-login', async (event) => {
+  return openKugouMusicLoginWindow(getSenderWindow(event));
+});
+
+ipcMain.handle('kugou-music-clear-login', async () => {
+  return clearKugouMusicLoginSession();
+});
+
 ipcMain.handle('mineradio-open-update-installer', async (_event, filePath) => {
   try {
     const target = path.resolve(String(filePath || ''));
@@ -1327,6 +1532,7 @@ async function createWindow() {
   process.env.PORT = String(port);
   process.env.COOKIE_FILE = path.join(app.getPath('userData'), '.cookie');
   process.env.QQ_COOKIE_FILE = path.join(app.getPath('userData'), '.qq-cookie');
+  process.env.KG_COOKIE_FILE = path.join(app.getPath('userData'), '.kg-cookie');
   process.env.MINERADIO_UPDATE_DIR = getUpdateDownloadDir();
   try {
     const legacyQQCookie = path.join(__dirname, '..', '.qq-cookie');
