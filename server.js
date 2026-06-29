@@ -3247,78 +3247,95 @@ async function kgGetSongUrl(hash, albumId, qualityPreference) {
 // KRC XOR decode key (16 bytes)
 var KRC_XOR_KEY = [64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105];
 
+// Check if decoded text looks like KRC (has `[ms,ms]` line headers)
+function looksLikeKrc(text) {
+  return /\[(\d+),(\d+)\]/.test(String(text || '').slice(0, 500));
+}
+
 // Decode KRC encrypted binary → plain KRC text
-// KRC format: 4-byte magic "krc1" + XOR-encrypted + zlib-compressed content
 function decodeKrc(bin) {
   try {
     if (bin.length <= 4) return null;
-    var payload = bin.slice(4);
-    // XOR decrypt
+    var payload = Buffer.from(bin.slice(4));
     for (var i = 0; i < payload.length; i++) {
       payload[i] ^= KRC_XOR_KEY[i % 16];
     }
-    // zlib decompress
     var textBytes = zlib.inflateSync(payload);
-    return textBytes.toString('utf8');
+    var text = textBytes.toString('utf8');
+    // Validate that it looks like KRC — if not, XOR key might be wrong
+    if (!looksLikeKrc(text)) {
+      console.warn('[KRC Decode] decoded text does not look like KRC, length=' + text.length);
+      return null;
+    }
+    return text;
   } catch (e) {
     console.warn('[KRC Decode]', e.message);
     return null;
   }
 }
 
-// Convert KRC word-timing format to YRC + line-level LRC
-// KRC: [<startMs>,<durationMs>]<word1><startMs>,<durationMs><word2>...
-// YRC: [<startMs>,<durationMs>]<word1>(<startMs>,<durationMs>)<word2>(<startMs>,<durationMs>)...
+// Strip any remaining KRC/YRC coordinate markers from plain text
+function stripLyricCoordinates(text) {
+  return String(text || '')
+    .replace(/<(\d+),(\d+)>/g, '')     // KRC word timings <ms,ms>
+    .replace(/\((\d+),(\d+),\d+\)/g, '') // YRC word timings (ms,ms,offset)
+    .replace(/\s+/g, ' ').trim();
+}
+
+// Convert KRC word-timing format → YRC + line-level LRC
+// KRC: [<startMs>,<durationMs>]word1<startMs,durMs>word2<startMs,durMs>...
+// YRC: [<startMs>,<durationMs>](<startMs>,<durMs>,0)word1(<startMs>,<durMs>,0)word2...
 function krcToYrc(krcText) {
   var lyricLines = [];
   var yrcLines = [];
-  // Split into per-line entries: each line starts with [<ms>,<ms>]
-  var lineRe = /\[(\d+),(\d+)\]/g;
-  var lastIndex = 0;
-  var match;
-  while ((match = lineRe.exec(krcText)) !== null) {
-    var lineStart = parseInt(match[1], 10);
-    var lineDuration = parseInt(match[2], 10);
-    // Find the next line head or end of string
-    var contentStart = match.index + match[0].length;
-    var nextMatch;
-    lineRe.lastIndex = contentStart;
-    nextMatch = lineRe.exec(krcText);
-    var contentEnd = nextMatch ? nextMatch.index : krcText.length;
-    lineRe.lastIndex = contentStart; // reset for next iteration
+  // Split per-line: each KRC line starts with [<ms>,<ms>]
+  var lines = String(krcText || '').split(/\r?\n/);
+  for (var li = 0; li < lines.length; li++) {
+    var line = lines[li].trim();
+    if (!line) continue;
+    var hdrMatch = line.match(/^\[(\d+),(\d+)\](.*)$/);
+    if (!hdrMatch) continue;
+    var lineStart = parseInt(hdrMatch[1], 10);
+    var lineDuration = parseInt(hdrMatch[2], 10);
+    var body = hdrMatch[3] || '';
+    if (!body) continue;
 
-    var rawContent = krcText.slice(contentStart, contentEnd);
-    // Parse word-level timings: <startMs>,<durationMs>word<startMs>,<durationMs>word...
+    // Parse word-level timings: <startMs,durMs>word<startMs,durMs>word...
+    // First word (before first timing tag) belongs to line start
     var wordRe = /<(\d+),(\d+)>/g;
-    var wordMatch;
     var words = [];
     var textPos = 0;
-    while ((wordMatch = wordRe.exec(rawContent)) !== null) {
-      var wStart = parseInt(wordMatch[1], 10);
-      var wDur = parseInt(wordMatch[2], 10);
-      // Text between previous word timing and this one
-      var wordText = rawContent.slice(textPos, wordMatch.index);
-      if (wordText) {
-        words.push({ t: wStart, d: wDur, text: wordText });
-      }
-      textPos = wordMatch.index + wordMatch[0].length;
+    var wm;
+    while ((wm = wordRe.exec(body)) !== null) {
+      var wStart = parseInt(wm[1], 10);
+      var wDur = parseInt(wm[2], 10);
+      var wordText = body.slice(textPos, wm.index);
+      if (wordText) words.push({ t: wStart, d: wDur, text: wordText });
+      textPos = wm.index + wm[0].length;
     }
-    // Remaining text after last word timing
-    var tailText = rawContent.slice(textPos);
+    // Remaining text after last timing tag
+    var tailText = body.slice(textPos);
     if (tailText) {
-      words.push({ t: words.length ? (words[words.length - 1].t + words[words.length - 1].d) : lineStart, d: 0, text: tailText });
+      words.push({ t: words.length ? words[words.length - 1].t + words[words.length - 1].d : lineStart, d: 0, text: tailText });
     }
+    // Strip any coordinate patterns from word texts
+    for (var w = 0; w < words.length; w++) {
+      words[w].text = stripLyricCoordinates(words[w].text);
+    }
+    words = words.filter(function(w) { return w.text; });
+    if (!words.length) continue;
 
-    // Build YRC line: (<startMs>,<durationMs>,<offset0>)word...
+    // Build YRC parts and clean LRC text
     var yrcParts = [];
     var lineText = '';
-    for (var w = 0; w < words.length; w++) {
+    for (w = 0; w < words.length; w++) {
       lineText += words[w].text;
       yrcParts.push('(' + words[w].t + ',' + words[w].d + ',0)' + words[w].text);
     }
+    lineText = stripLyricCoordinates(lineText);
     if (!lineText) continue;
 
-    // Build LRC timestamp
+    // LRC timestamp
     var totalSec = lineStart / 1000;
     var mins = Math.floor(totalSec / 60);
     var secs = (totalSec % 60).toFixed(2);
@@ -3592,7 +3609,10 @@ async function kgFetchPlaylistDetail(id) {
   var u = KG_PLAYLIST_DETAIL_URL + '?specialid=' + encodeURIComponent(id) + '&page=1&pagesize=300&version=9108&area_code=1';
   var text = await kgRequest(u, { headers: { ...KG_MOBILE_HEADERS } });
   var resp = parseJSONText(text);
-  var info = (resp && resp.data && resp.data.info) || [];
+  // Try multiple response structures (mobile API varies)
+  var info = (resp && resp.data && resp.data.info) || (resp && resp.info) || (resp && resp.data) || [];
+  if (!Array.isArray(info)) info = (info.list || info.songs || []);
+  if (!Array.isArray(info)) info = [];
   var tracks = info.map(mapKGPlaylistTrack).filter(Boolean);
   tracks.reverse(); // newest first
   return { provider: 'kugou', id: id, tracks: tracks, total: tracks.length };

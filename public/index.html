@@ -16113,10 +16113,10 @@ function openHomePlaylist(index) {
   var item = homeDiscoverState.playlists[index];
   var panel = document.getElementById('playlist-panel');
   var panelIsOpen = panel && (panel.classList.contains('show') || panel.classList.contains('peek'));
+  // Toggle: click same tile again → close and go back to home
   if (homeActivePlaylistIndex === index && panelIsOpen && playQueue.length) {
     homeActivePlaylistIndex = -1;
-    togglePlaylistPanel(false);
-    showToast('已关闭歌单详情');
+    goHome();
     return;
   }
   homeActivePlaylistIndex = index;
