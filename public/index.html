@@ -18625,8 +18625,53 @@ async function playQueueAt(idx, opts) {
     var proxyAudioUrl = '/api/audio?url=' + encodeURIComponent(data.url);
     audio.src = proxyAudioUrl;
     updatePlaybackProgressUi();
+    audio._kgStreamRetries = 0;
+    audio._hadDecodeError = false;
+    audio.onerror = function(){
+      var errCode = audio.error ? audio.error.code : 0;
+      if (token !== trackSwitchToken) return;
+      // MEDIA_ERR_DECODE (3): corrupted frame — reload src, skip past bad section
+      if (errCode === 3) {
+        if (audio._kgStreamRetries >= 3) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); return; }
+        audio._kgStreamRetries++;
+        var skipTo = (audio.currentTime || 0) + 3;
+        var maxPos = (audio.duration || song.duration || 0) - 5;
+        if (maxPos <= 0 || skipTo >= maxPos) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); return; }
+        audio._hadDecodeError = true;
+        var curSrc = audio.src;
+        audio.src = '';
+        audio.src = curSrc;
+        audio.load();
+        var doSeek = function(){
+          if (token !== trackSwitchToken) return;
+          try { audio.currentTime = skipTo; } catch(e) {}
+          var p3 = audio.play(); if (p3 && p3.catch) p3.catch(function(){});
+        };
+        audio.addEventListener('canplay', doSeek, { once: true });
+        setTimeout(doSeek, 1200);
+        return;
+      }
+      // MEDIA_ERR_NETWORK (2): stream drop — re-fetch URL and resume
+      if (audio._kgStreamRetries >= 2) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); return; }
+      audio._kgStreamRetries++;
+      var resumePos = Math.max(0, (audio.currentTime || 0) - 0.5);
+      retryKGStream(song, idx, token, opts, resumePos, audio._kgStreamRetries);
+    };
     audio.onended = function(){
       if (token !== trackSwitchToken) return;
+      // Check if song ended naturally (within 3s of expected duration)
+      var audioDur = audio.duration || 0;
+      var songDur = (song && song.duration) || 0;
+      var pos = audio.currentTime || 0;
+      var refDur = songDur > 0 ? songDur : audioDur;
+      var endedNaturally = refDur > 0 && pos > 0 && (refDur - pos) < 3;
+      if (!endedNaturally && audio._kgStreamRetries < 2 && songProviderKey(song) === 'kugou') {
+        audio._kgStreamRetries++;
+        var resumePosEnd = Math.max(0, pos - 0.5);
+        retryKGStream(song, idx, token, opts, resumePosEnd, audio._kgStreamRetries);
+        return;
+      }
+      audio._kgStreamRetries = 0;
       finalizeListenSession(true);
       if (playMode === 'single') setTimeout(function(){ playQueueAt(currentIdx, { autoRepeat: true }); }, 0);
       else setTimeout(nextTrack, 0);
@@ -18816,6 +18861,43 @@ function setPlayIcon(p) {
   document.getElementById('play-icon').innerHTML = p
     ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>'
     : '<path d="M8 5v14l11-7z"/>';
+}
+async function retryKGStream(song, idx, token, opts, resumePos, retryCount) {
+  // Re-fetch KuGou URL and resume playback from resumePos
+  if (!song || songProviderKey(song) !== 'kugou') return;
+  if (token !== trackSwitchToken) return;
+  try {
+    var kgParams = 'hash=' + encodeURIComponent(song.kgHash || song.id || '') + '&albumId=' + encodeURIComponent(song.kgAlbumId || '0');
+    if (song.kgSQHash) kgParams += '&sqHash=' + encodeURIComponent(song.kgSQHash);
+    if (song.kgHQHash) kgParams += '&hqHash=' + encodeURIComponent(song.kgHQHash);
+    if (song.kgOgg320Hash) kgParams += '&ogg320Hash=' + encodeURIComponent(song.kgOgg320Hash);
+    if (song.kgOgg128Hash) kgParams += '&ogg128Hash=' + encodeURIComponent(song.kgOgg128Hash);
+    if (song.kgFileHash) kgParams += '&fileHash=' + encodeURIComponent(song.kgFileHash);
+    if (song.kgResHash) kgParams += '&resHash=' + encodeURIComponent(song.kgResHash);
+    var data = await apiJson('/api/kg/song/url?' + kgParams);
+    if (token !== trackSwitchToken) return;
+    if (!data || !data.url) {
+      console.warn('[KGStreamRetry] failed to get fresh URL (retry=' + retryCount + ')');
+      if (retryCount >= 2) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); }
+      return;
+    }
+    var newUrl = '/api/audio?url=' + encodeURIComponent(data.url);
+    var wasPlaying = !audio.paused;
+    audio.src = newUrl;
+    audio.load();
+    // Resume from where we left off
+    var applyResume = function(){
+      if (token !== trackSwitchToken) return;
+      try { audio.currentTime = resumePos; } catch(e) {}
+      if (wasPlaying) { var p = audio.play(); if (p && p.catch) p.catch(function(){}); }
+    };
+    audio.addEventListener('canplay', applyResume, { once: true });
+    setTimeout(applyResume, 800);
+    console.log('[KGStreamRetry] resumed from ' + resumePos.toFixed(1) + 's (retry=' + retryCount + ')');
+  } catch (e) {
+    console.warn('[KGStreamRetry] error:', e && e.message ? e.message : e);
+    if (retryCount >= 2) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); }
+  }
 }
 function nextTrack() {
   if (!playQueue.length) return;
@@ -20088,6 +20170,8 @@ function seekFromProgressPointer(e, emitParticles) {
   setProgressVisual(ratio * 100);
   syncBeatMapPlaybackCursor(audio.currentTime);
   if (emitParticles) emitProgressDragParticles(e.clientX, rect.top + rect.height / 2);
+  // Show loading during seek
+  if (audio.networkState === 2) showLoading();
 }
 var progressBar = document.getElementById('progress-bar');
 progressBar.addEventListener('pointerdown', function(e){

@@ -2800,8 +2800,9 @@ async function kgCheckQRLogin(key, deviceCookies) {
 
   // status: 0=waiting, 1=waiting, 2=scanned, 3=confirmed, 4=success, 5/6/-1=expired
   if (status === 4) {
-    var token = ((body && body.data && body.data.token) || '').trim();
-    var userID = String(body && body.data && body.data.userid || '').replace(/\D/g, '');
+    var data = (body && body.data) || {};
+    var token = (data.token || '').trim();
+    var userID = String(data.userid || '').replace(/\D/g, '');
     if (!token || !userID || userID === '0') {
       result.status = -1;
       result.message = 'QR login succeeded but token or userid is empty';
@@ -2809,6 +2810,11 @@ async function kgCheckQRLogin(key, deviceCookies) {
     }
     cookies.token = token;
     cookies.userid = userID;
+    // Extract user profile from QR response (nickname/avatar)
+    var nickname = data.nickname || data.username || data.user_name || '';
+    var headimg = data.headimg || data.avatar || data.img || data.pic || '';
+    if (nickname) cookies.nickname = encodeURIComponent(nickname);
+    if (headimg) cookies.headimg = headimg;
 
     // Register device to get dfid
     try {
@@ -3214,6 +3220,39 @@ async function kgIsVipAccount() {
   } catch (e) { return false; }
 }
 
+async function kgFetchUserInfo() {
+  try {
+    var cookieObj = kgCookieObject();
+    var userId = kgCookieUserId(cookieObj);
+    var token = kgCookieToken(cookieObj);
+    if (!userId || !token) return null;
+    var clienttime = String(Math.floor(Date.now() / 1000));
+    // Use KuGou user info API to get nickname + avatar
+    var resp = await kgGetJSON('http://mobilecdnbj.kugou.com/api/v3/user/info', {
+      userid: userId, token: token,
+      appid: KG_LITE_APP_ID, clientver: KG_LITE_VER, clienttime: clienttime,
+    }, { headers: { ...KG_MOBILE_HEADERS } });
+    if (resp && resp.status === 1 && resp.data) {
+      var d = resp.data;
+      var nickname = d.nickname || d.username || d.user_name || d.name || '';
+      var avatar = d.headimg || d.avatar || d.img || d.pic || d.icon || '';
+      if (nickname || avatar) return { nickname: nickname, avatar: avatar };
+    }
+    // Fallback: try kmr service endpoint
+    var kmrResp = await kgGetJSON('http://kmr.service.kugou.com/v1/user/get_info', {
+      userid: userId, token: token,
+      appid: KG_LITE_APP_ID, clientver: KG_LITE_VER, clienttime: clienttime,
+    }, { headers: { ...KG_MOBILE_HEADERS } });
+    if (kmrResp && kmrResp.status === 1 && kmrResp.data) {
+      var kd = kmrResp.data;
+      var knick = kd.nickname || kd.username || kd.user_name || kd.name || '';
+      var kav = kd.headimg || kd.avatar || kd.img || kd.pic || kd.icon || '';
+      if (knick || kav) return { nickname: knick, avatar: kav };
+    }
+    return null;
+  } catch (e) { console.warn('[KGUserInfo] fetch failed:', e.message); return null; }
+}
+
 async function kgGetSongUrl(hash, albumId, qualityPreference) {
   var songHash = String(hash || '').trim();
   if (!songHash || songHash.length < 16) return { provider: 'kugou', url: '', error: 'MISSING_HASH', message: 'Missing valid Kugou song hash', playable: false };
@@ -3230,7 +3269,13 @@ async function kgGetSongUrl(hash, albumId, qualityPreference) {
   if (extras.fileHash && isValidHash(extras.fileHash)) allHashes.push(extras.fileHash);
   if (extras.resHash && isValidHash(extras.resHash)) allHashes.push(extras.resHash);
 
-  // Layer 1: Mobile getSongInfo
+  // Layer 0 (preferred): V5 gateway — newest API, best quality URLs (needs app login)
+  var v5Info = await kgFetchURLV5(songHash, '0', extras.albumId || '0');
+  if (v5Info && v5Info.url) {
+    return { provider: 'kugou', url: v5Info.url, trial: false, playable: true, level: v5Info.bitrate >= 700 ? 'lossless' : (v5Info.bitrate >= 320 ? 'exhigh' : 'standard'), quality: (v5Info.bitrate || '128') + 'k', bitrate: v5Info.bitrate || 128 };
+  }
+
+  // Layer 1: Mobile getSongInfo (fallback if V5 unavailable — no app login needed)
   var info = await kgFetchSongInfo(songHash);
   if (info && info.url) {
     return { provider: 'kugou', url: info.url, trial: false, playable: true, level: info.bitrate >= 700 ? 'lossless' : (info.bitrate >= 320 ? 'exhigh' : 'standard'), quality: (info.bitrate || '128') + 'k', bitrate: info.bitrate || 128 };
@@ -4849,12 +4894,35 @@ const server = http.createServer(async (req, res) => {
       const userId = kgCookieUserId(cookieObj);
       const loggedIn = kgCookieHasLogin(cookieObj);
       const isVip = loggedIn ? await kgIsVipAccount().catch(() => false) : false;
+      var nickname = loggedIn ? kgCookieNickname(cookieObj) : '酷狗音乐';
+      var avatar = kgCookieAvatar(cookieObj);
+
+      // If avatar or nickname missing from cookies, try fetching from KuGou API
+      if (loggedIn && (!nickname || nickname === '酷狗用户' || !avatar)) {
+        var ui = await kgFetchUserInfo().catch(() => null);
+        if (ui) {
+          if (!nickname || nickname === '酷狗用户') {
+            nickname = ui.nickname || nickname;
+            if (ui.nickname) {
+              var merged = Object.assign({}, cookieObj, { nickname: encodeURIComponent(ui.nickname) });
+              saveKGCookie(Object.keys(merged).map(function(k) { return k + '=' + merged[k]; }).join('; '));
+            }
+          }
+          if (!avatar && ui.avatar) {
+            avatar = ui.avatar;
+            var merged2 = Object.assign({}, cookieObj, { headimg: ui.avatar });
+            if (ui.nickname) merged2.nickname = encodeURIComponent(ui.nickname);
+            saveKGCookie(Object.keys(merged2).map(function(k) { return k + '=' + merged2[k]; }).join('; '));
+          }
+        }
+      }
+
       sendJSON(res, {
         provider: 'kugou',
         loggedIn,
         userId: userId || '',
-        nickname: loggedIn ? kgCookieNickname(cookieObj) : '酷狗音乐',
-        avatar: kgCookieAvatar(cookieObj),
+        nickname: nickname,
+        avatar: avatar,
         hasCookie: !!kgCookie,
         isVip: isVip,
         vipType: isVip ? 1 : 0,
@@ -5582,12 +5650,26 @@ const server = http.createServer(async (req, res) => {
 
   // ---------- 音频代理 (支持 Range) ----------
   if (pn === '/api/audio') {
+    var audioHeadersSent = false;
+    var audioAborted = false;
+    var audioController = null;
     try {
       const audioUrl = url.searchParams.get('url');
       if (!audioUrl) { res.writeHead(400); res.end('Missing url'); return; }
       const range = req.headers.range || '';
       const hdr = audioProxyHeadersFor(audioUrl, range);
-      const up = await fetch(audioUrl, { headers: hdr });
+
+      // 上游连接超时 10s
+      audioController = new AbortController();
+      var connectTimer = setTimeout(function(){ audioAborted = true; audioController.abort(); }, 10000);
+      var up;
+      try {
+        up = await fetch(audioUrl, { headers: hdr, signal: audioController.signal });
+      } finally {
+        clearTimeout(connectTimer);
+      }
+      if (audioAborted) { res.writeHead(504); res.end('Upstream timeout'); return; }
+
       const out = {
         'Content-Type': audioContentTypeForUrl(audioUrl, up.headers.get('content-type')),
         'Access-Control-Allow-Origin': '*',
@@ -5596,10 +5678,32 @@ const server = http.createServer(async (req, res) => {
       const cl = up.headers.get('content-length'); if (cl) out['Content-Length'] = cl;
       const cr = up.headers.get('content-range');  if (cr) out['Content-Range']  = cr;
       res.writeHead(up.status, out);
+      audioHeadersSent = true;
+
+      // 客户端断开时取消上游
+      req.on('close', function(){
+        audioAborted = true;
+        try { audioController.abort(); } catch(e) {}
+      });
+
       const reader = up.body.getReader();
-      while (true) { const c = await reader.read(); if (c.done) break; res.write(c.value); }
-      res.end();
-    } catch (err) { console.error('[Audio]', err); res.writeHead(500); res.end(); }
+      while (!audioAborted) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        res.write(chunk.value);
+      }
+      if (!audioAborted) res.end();
+    } catch (err) {
+      console.error('[Audio]', err && err.message ? err.message : err);
+      if (!audioHeadersSent) {
+        // 响应头尚未发送 → 可以返回错误状态
+        try { res.writeHead(err.name === 'AbortError' || err.message === 'CHUNK_TIMEOUT' ? 504 : 502); } catch(e) {}
+        try { res.end(err.name === 'AbortError' ? 'Upstream timeout' : 'Upstream fetch failed'); } catch(e) {}
+      } else {
+        // 响应头已发送 → 流中断，优雅结束
+        try { res.end(); } catch(e) {}
+      }
+    }
     return;
   }
 
