@@ -18626,6 +18626,7 @@ async function playQueueAt(idx, opts) {
     audio.src = proxyAudioUrl;
     updatePlaybackProgressUi();
     audio._kgStreamRetries = 0;
+    audio._kgFallbackUrl = data.fallback || '';  // 服务端返回的备用URL，重试时优先使用
     audio._hadDecodeError = false;
     audio.onerror = function(){
       var errCode = audio.error ? audio.error.code : 0;
@@ -18635,7 +18636,7 @@ async function playQueueAt(idx, opts) {
         if (audio._kgStreamRetries >= 3) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); return; }
         audio._kgStreamRetries++;
         var skipTo = (audio.currentTime || 0) + 3;
-        var maxPos = (audio.duration || song.duration || 0) - 5;
+        var maxPos = (audio.duration || playbackDurationFromSong(song) || 0) - 5;
         if (maxPos <= 0 || skipTo >= maxPos) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); return; }
         audio._hadDecodeError = true;
         var curSrc = audio.src;
@@ -18661,7 +18662,7 @@ async function playQueueAt(idx, opts) {
       if (token !== trackSwitchToken) return;
       // Check if song ended naturally (within 3s of expected duration)
       var audioDur = audio.duration || 0;
-      var songDur = (song && song.duration) || 0;
+      var songDur = playbackDurationFromSong(song);  // 归一化为秒 (song.duration 可能是毫秒)
       var pos = audio.currentTime || 0;
       var refDur = songDur > 0 ? songDur : audioDur;
       var endedNaturally = refDur > 0 && pos > 0 && (refDur - pos) < 3;
@@ -18867,21 +18868,39 @@ async function retryKGStream(song, idx, token, opts, resumePos, retryCount) {
   if (!song || songProviderKey(song) !== 'kugou') return;
   if (token !== trackSwitchToken) return;
   try {
-    var kgParams = 'hash=' + encodeURIComponent(song.kgHash || song.id || '') + '&albumId=' + encodeURIComponent(song.kgAlbumId || '0');
-    if (song.kgSQHash) kgParams += '&sqHash=' + encodeURIComponent(song.kgSQHash);
-    if (song.kgHQHash) kgParams += '&hqHash=' + encodeURIComponent(song.kgHQHash);
-    if (song.kgOgg320Hash) kgParams += '&ogg320Hash=' + encodeURIComponent(song.kgOgg320Hash);
-    if (song.kgOgg128Hash) kgParams += '&ogg128Hash=' + encodeURIComponent(song.kgOgg128Hash);
-    if (song.kgFileHash) kgParams += '&fileHash=' + encodeURIComponent(song.kgFileHash);
-    if (song.kgResHash) kgParams += '&resHash=' + encodeURIComponent(song.kgResHash);
-    var data = await apiJson('/api/kg/song/url?' + kgParams);
-    if (token !== trackSwitchToken) return;
-    if (!data || !data.url) {
-      console.warn('[KGStreamRetry] failed to get fresh URL (retry=' + retryCount + ')');
-      if (retryCount >= 2) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); }
-      return;
+    var newUrl = null;
+
+    // ── 第1次重试：优先用服务端返回的 fallback URL（零网络延迟）──
+    if (retryCount === 1 && audio._kgFallbackUrl && /^https?:\/\//i.test(audio._kgFallbackUrl)) {
+      console.log('[KGStreamRetry] using cached fallback URL (retry=' + retryCount + ')');
+      newUrl = '/api/audio?url=' + encodeURIComponent(audio._kgFallbackUrl);
+      audio._kgFallbackUrl = ''; // 用完清掉，避免重复使用
     }
-    var newUrl = '/api/audio?url=' + encodeURIComponent(data.url);
+
+    // ── fallback 不可用 → 调服务端获取新URL ──
+    if (!newUrl) {
+      var retryQuality = (opts && opts.qualityOverride) || playbackQuality || 'standard';
+      var kgParams = 'hash=' + encodeURIComponent(song.kgHash || song.id || '') + '&albumId=' + encodeURIComponent(song.kgAlbumId || '0');
+      kgParams += '&quality=' + encodeURIComponent(retryQuality);
+      kgParams += '&retry=' + retryCount;
+      if (song.kgSQHash) kgParams += '&sqHash=' + encodeURIComponent(song.kgSQHash);
+      if (song.kgHQHash) kgParams += '&hqHash=' + encodeURIComponent(song.kgHQHash);
+      if (song.kgOgg320Hash) kgParams += '&ogg320Hash=' + encodeURIComponent(song.kgOgg320Hash);
+      if (song.kgOgg128Hash) kgParams += '&ogg128Hash=' + encodeURIComponent(song.kgOgg128Hash);
+      if (song.kgFileHash) kgParams += '&fileHash=' + encodeURIComponent(song.kgFileHash);
+      if (song.kgResHash) kgParams += '&resHash=' + encodeURIComponent(song.kgResHash);
+      var data = await apiJson('/api/kg/song/url?' + kgParams);
+      if (token !== trackSwitchToken) return;
+      if (!data || !data.url) {
+        console.warn('[KGStreamRetry] failed to get fresh URL (retry=' + retryCount + ')');
+        if (retryCount >= 2) { audio._kgStreamRetries = 0; setTimeout(nextTrack, 0); }
+        return;
+      }
+      // 更新 fallback 缓存（服务端可能返回新的备用URL）
+      audio._kgFallbackUrl = data.fallback || '';
+      newUrl = '/api/audio?url=' + encodeURIComponent(data.url);
+    }
+
     var wasPlaying = !audio.paused;
     audio.src = newUrl;
     audio.load();

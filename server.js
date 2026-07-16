@@ -3041,7 +3041,34 @@ async function kgSearch(keywords, limit) {
   return lists.slice(0, limit).map(mapKGSearchSong);
 }
 
-// ============ 酷狗歌曲 URL（5层 VIP 降级链） ============
+// ============ 酷狗歌曲 URL（5层 VIP 降级链 + 并行 + 缓存） ============
+
+// URL 内存缓存：避免重试时重复调 Kugou API
+var KG_URL_CACHE = new Map();        // key: songHash, value: { urls: [...], expires: timestamp }
+var KG_URL_CACHE_TTL = 10 * 60 * 1000; // 10 分钟
+var KG_URL_CACHE_MAX = 200;           // 最多缓存 200 首歌
+
+function kgCacheGet(hash) {
+  var entry = KG_URL_CACHE.get(hash);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) { KG_URL_CACHE.delete(hash); return null; }
+  return entry;
+}
+
+function kgCacheSet(hash, urls) {
+  // 限制缓存大小，防止内存泄漏
+  if (KG_URL_CACHE.size >= KG_URL_CACHE_MAX) {
+    var firstKey = KG_URL_CACHE.keys().next().value;
+    if (firstKey) KG_URL_CACHE.delete(firstKey);
+  }
+  KG_URL_CACHE.set(hash, { urls: urls, expires: Date.now() + KG_URL_CACHE_TTL });
+}
+
+// 定期清理过期缓存（每 5 分钟）
+setInterval(function() {
+  var now = Date.now();
+  KG_URL_CACHE.forEach(function(v, k) { if (now > v.expires) KG_URL_CACHE.delete(k); });
+}, 5 * 60 * 1000);
 async function kgFetchURLV5(hash, albumAudioId, albumId) {
   var cookieObj = kgCookieObject();
   var token = kgCookieToken(cookieObj);
@@ -3079,12 +3106,14 @@ async function kgFetchURLV5(hash, albumAudioId, albumId) {
   var resp = parseJSONText(text);
   var url = findKGUrl(resp);
   if (!url) return null;
-  return {
+  var info = {
     url: url,
     bitrate: findKGInt(resp, 'bitRate', 'bitrate'),
     ext: findKGString(resp, 'fileType', 'extName', 'extname') || 'flac',
     size: findKGInt64(resp, 'fileSize', 'filesize'),
   };
+  info.trial = kgIsTrialResponse(resp, info);
+  return info;
 }
 
 function findKGUrl(resp) {
@@ -3122,7 +3151,7 @@ async function kgFetchSongInfo(hash) {
   var text = await kgRequest(u, { headers: { ...KG_MOBILE_HEADERS } });
   var resp = parseJSONText(text);
   if (!resp || resp.errcode !== 0 || !resp.url) return null;
-  return {
+  var info = {
     url: String(resp.url).replace(/\\\//g, '/'),
     bitrate: kgNormalizeBitrate(resp.bitRate || 0),
     ext: resp.extName || '',
@@ -3131,6 +3160,8 @@ async function kgFetchSongInfo(hash) {
     artist: resp.author_name || '',
     cover: kgCoverUrl(resp.album_img || ''),
   };
+  info.trial = kgIsTrialResponse(resp, info);
+  return info;
 }
 
 async function kgFetchTrackerSongInfo(hash) {
@@ -3147,7 +3178,7 @@ async function kgFetchTrackerSongInfo(hash) {
       if (typeof purl === 'object') purl = (Array.isArray(purl) ? purl[0] : '') || '';
       purl = String(purl || '').replace(/\\\//g, '/');
       if (purl && resp.errcode === 0) {
-        return {
+        var tInfo = {
           url: purl,
           bitrate: kgNormalizeBitrate(resp.bitRate || 0),
           ext: resp.extName || '',
@@ -3156,6 +3187,8 @@ async function kgFetchTrackerSongInfo(hash) {
           artist: resp.author_name || '',
           cover: kgCoverUrl(resp.album_img || ''),
         };
+        tInfo.trial = kgIsTrialResponse(resp, tInfo);
+        return tInfo;
       }
     } catch (e) { continue; }
   }
@@ -3193,7 +3226,7 @@ async function kgFetchSonginfoV2(hash) {
   var step2 = parseJSONText(step2Text);
   var url = ((step2 && step2.data && (step2.data.play_url || step2.data.play_backup_url)) || '').replace(/\\\//g, '/');
   if (!url) return null;
-  return {
+  var v2Info = {
     url: url,
     bitrate: kgNormalizeBitrate((step2 && step2.data && step2.data.bitrate) || 0),
     ext: (step2 && step2.data && step2.data.extname) || '',
@@ -3202,6 +3235,24 @@ async function kgFetchSonginfoV2(hash) {
     artist: (step2 && step2.data && step2.data.author_name) || '',
     cover: kgCoverUrl((step2 && step2.data && step2.data.img) || ''),
   };
+  v2Info.trial = kgIsTrialResponse(step2 && step2.data, v2Info);
+  return v2Info;
+}
+
+// 检测 Kugou API 返回是否为试听/截断音频
+function kgIsTrialResponse(resp, info) {
+  // 1. 明确的试听标志位
+  if (resp && (resp.is_free_part === 1 || resp.isFreePart === 1 ||
+      resp.freeTrial === 1 || resp.trial === 1 ||
+      resp.IsFreePart === '1')) return true;
+  // 2. URL 中包含 trial/clip/preview 等关键词
+  var urlCheck = (info && info.url) || (resp && (resp.url || resp.play_url || ''));
+  if (typeof urlCheck === 'string' && /\b(trial|clip|preview|free_part)\b/i.test(urlCheck)) return true;
+  // 3. 文件太小 + 码率不低 → 可能是截断音频（< 1.5MB 且 ≥ 128kbps）
+  var size = (info && info.size) || (resp && (resp.fileSize || resp.filesize)) || 0;
+  var bitrate = (info && info.bitrate) || (resp && (resp.bitRate || resp.bitrate)) || 0;
+  if (size > 0 && size < 1500000 && bitrate >= 128) return true;
+  return false;
 }
 
 function looksLossless(ext, bitrate, size) {
@@ -3253,7 +3304,7 @@ async function kgFetchUserInfo() {
   } catch (e) { console.warn('[KGUserInfo] fetch failed:', e.message); return null; }
 }
 
-async function kgGetSongUrl(hash, albumId, qualityPreference) {
+async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   var songHash = String(hash || '').trim();
   if (!songHash || songHash.length < 16) return { provider: 'kugou', url: '', error: 'MISSING_HASH', message: 'Missing valid Kugou song hash', playable: false };
   var loggedIn = kgCookieHasLogin();
@@ -3269,37 +3320,97 @@ async function kgGetSongUrl(hash, albumId, qualityPreference) {
   if (extras.fileHash && isValidHash(extras.fileHash)) allHashes.push(extras.fileHash);
   if (extras.resHash && isValidHash(extras.resHash)) allHashes.push(extras.resHash);
 
-  // Layer 0 (preferred): V5 gateway — newest API, best quality URLs (needs app login)
-  var v5Info = await kgFetchURLV5(songHash, '0', extras.albumId || '0');
-  if (v5Info && v5Info.url) {
-    return { provider: 'kugou', url: v5Info.url, trial: false, playable: true, level: v5Info.bitrate >= 700 ? 'lossless' : (v5Info.bitrate >= 320 ? 'exhigh' : 'standard'), quality: (v5Info.bitrate || '128') + 'k', bitrate: v5Info.bitrate || 128 };
+  // 辅助函数：构建统一返回格式
+  function makeResult(info, fallbackUrl, layer) {
+    if (!info || !info.url) return null;
+    return {
+      provider: 'kugou', url: info.url,
+      fallback: fallbackUrl || '',
+      trial: !!info.trial,
+      playable: true,
+      layer: layer || 'unknown',
+      level: info.bitrate >= 700 ? 'lossless' : (info.bitrate >= 320 ? 'exhigh' : 'standard'),
+      quality: (info.bitrate || '128') + 'k',
+      bitrate: info.bitrate || 128,
+    };
   }
 
-  // Layer 1: Mobile getSongInfo (fallback if V5 unavailable — no app login needed)
-  var info = await kgFetchSongInfo(songHash);
-  if (info && info.url) {
-    return { provider: 'kugou', url: info.url, trial: false, playable: true, level: info.bitrate >= 700 ? 'lossless' : (info.bitrate >= 320 ? 'exhigh' : 'standard'), quality: (info.bitrate || '128') + 'k', bitrate: info.bitrate || 128 };
-  }
-
-  // Layer 2: Try all hash candidates through tracker CDN + songinfoV2
-  if (loggedIn && hasApp) {
-    for (var hi = 0; hi < allHashes.length; hi++) {
-      var h = allHashes[hi];
-      // Tracker CDN
-      var trackerInfo = await kgFetchTrackerSongInfo(h);
-      if (trackerInfo && trackerInfo.url) {
-        return { provider: 'kugou', url: trackerInfo.url, trial: false, playable: true, level: trackerInfo.bitrate >= 700 ? 'lossless' : (trackerInfo.bitrate >= 320 ? 'exhigh' : 'standard'), quality: (trackerInfo.bitrate || '128') + 'k', bitrate: trackerInfo.bitrate || 128, vipAccess: true };
-      }
-      // Songinfo V2 (needs t + KugooID web cookies — now preserved from web login)
-      var v2Info = await kgFetchSonginfoV2(h);
-      if (v2Info && v2Info.url) {
-        return { provider: 'kugou', url: v2Info.url, trial: false, playable: true, level: v2Info.bitrate >= 700 ? 'lossless' : (v2Info.bitrate >= 320 ? 'exhigh' : 'standard'), quality: (v2Info.bitrate || '128') + 'k', bitrate: v2Info.bitrate || 128, vipAccess: true };
+  // ── 重试路径：优先从缓存取备用URL ──
+  if (isRetry) {
+    var cached = kgCacheGet(songHash);
+    if (cached && cached.urls.length > 0) {
+      // 返回缓存中第一个未过期的备用 URL
+      var fallbackEntry = cached.urls.shift(); // 取一个就移除
+      if (cached.urls.length === 0) KG_URL_CACHE.delete(songHash);
+      var fbInfo = { url: fallbackEntry.url, bitrate: fallbackEntry.bitrate || 128, trial: fallbackEntry.trial || false };
+      var fbResult = makeResult(fbInfo, '', fallbackEntry.layer || 'cache');
+      if (fbResult) {
+        console.log('[KGSongUrl] retry: using cached fallback URL (layer=' + fallbackEntry.layer + ', remaining=' + cached.urls.length + ')');
+        return fbResult;
       }
     }
-    return { provider: 'kugou', url: '', playable: false, error: 'KG_URL_UNAVAILABLE', loggedIn: true, reason: 'copyright_unavailable', message: '酷狗未返回播放地址，此歌曲可能已下架或版权受限' };
+    // 缓存为空或过期 → 降级到正常解析
+    console.log('[KGSongUrl] retry: cache miss, falling back to live resolution');
   }
 
-  return { provider: 'kugou', url: '', playable: false, error: 'KG_URL_UNAVAILABLE', loggedIn: false, reason: 'login_required', message: '酷狗需要 App 扫码登录后才能播放此歌曲' };
+  // ── 并行解析 Layer 0 (V5) + Layer 1 (Mobile) ──
+  var v5Task = kgFetchURLV5(songHash, '0', extras.albumId || '0').catch(function(e) { console.warn('[KGSongUrl] V5 fetch error:', e.message); return null; });
+  var mobileTask = kgFetchSongInfo(songHash).catch(function(e) { console.warn('[KGSongUrl] Mobile fetch error:', e.message); return null; });
+
+  var [v5Info, mobileInfo] = await Promise.allSettled([v5Task, mobileTask]).then(function(results) {
+    return [results[0].value, results[1].value];
+  });
+
+  // 收集所有可用URL到缓存池
+  var urlPool = [];
+
+  if (v5Info && v5Info.url) {
+    urlPool.push({ url: v5Info.url, bitrate: v5Info.bitrate || 0, trial: !!v5Info.trial, layer: 'v5' });
+  }
+  if (mobileInfo && mobileInfo.url) {
+    urlPool.push({ url: mobileInfo.url, bitrate: mobileInfo.bitrate || 0, trial: !!mobileInfo.trial, layer: 'mobile' });
+  }
+
+  // Layer 2 (已登录且有 App Cookie): Tracker CDN + SonginfoV2
+  if (loggedIn && hasApp && urlPool.length < 2) {
+    for (var hi = 0; hi < allHashes.length && urlPool.length < 3; hi++) {
+      var h = allHashes[hi];
+      try {
+        var trackerInfo = await kgFetchTrackerSongInfo(h);
+        if (trackerInfo && trackerInfo.url) {
+          urlPool.push({ url: trackerInfo.url, bitrate: trackerInfo.bitrate || 0, trial: !!trackerInfo.trial, layer: 'tracker' });
+        }
+      } catch (e) { /* continue */ }
+      try {
+        var v2Info = await kgFetchSonginfoV2(h);
+        if (v2Info && v2Info.url) {
+          urlPool.push({ url: v2Info.url, bitrate: v2Info.bitrate || 0, trial: !!v2Info.trial, layer: 'v2' });
+        }
+      } catch (e) { /* continue */ }
+    }
+  }
+
+  // ── 没有可用 URL ──
+  if (urlPool.length === 0) {
+    if (loggedIn && hasApp) {
+      return { provider: 'kugou', url: '', playable: false, error: 'KG_URL_UNAVAILABLE', loggedIn: true, reason: 'copyright_unavailable', message: '酷狗未返回播放地址，此歌曲可能已下架或版权受限' };
+    }
+    return { provider: 'kugou', url: '', playable: false, error: 'KG_URL_UNAVAILABLE', loggedIn: false, reason: 'login_required', message: '酷狗需要 App 扫码登录后才能播放此歌曲' };
+  }
+
+  // 按音质排序（高码率优先），选最好的作为主URL
+  urlPool.sort(function(a, b) { return (b.bitrate || 0) - (a.bitrate || 0); });
+  var best = urlPool.shift(); // 取出最好的作为主URL
+  var fallbackUrl = urlPool.length > 0 ? urlPool[0].url : '';
+
+  // 缓存剩余URL（用于重试）
+  if (urlPool.length > 0) {
+    kgCacheSet(songHash, urlPool);
+    console.log('[KGSongUrl] cached ' + urlPool.length + ' fallback URLs for hash=' + songHash.slice(0, 16) + '...');
+  }
+
+  var primaryInfo = { url: best.url, bitrate: best.bitrate || 128, trial: best.trial || false };
+  return makeResult(primaryInfo, fallbackUrl, best.layer);
 }
 
 // ============ 酷狗歌词 ============
@@ -4865,7 +4976,7 @@ const server = http.createServer(async (req, res) => {
         fileHash: url.searchParams.get('fileHash') || '',
         resHash: url.searchParams.get('resHash') || '',
       };
-      const info = await kgGetSongUrl(hash, hashExtras, quality);
+      const info = await kgGetSongUrl(hash, hashExtras, quality, !!url.searchParams.get('retry'));
       sendJSON(res, info);
     } catch (err) {
       console.error('[KGSongUrl]', err);
@@ -5687,8 +5798,25 @@ const server = http.createServer(async (req, res) => {
       });
 
       const reader = up.body.getReader();
+      const READ_TIMEOUT_MS = 30000; // 单次读取超时 30s，防止上游卡死不释放
       while (!audioAborted) {
-        var chunk = await reader.read();
+        var chunk;
+        try {
+          chunk = await Promise.race([
+            reader.read(),
+            new Promise(function(_, reject) {
+              setTimeout(function() { reject(new Error('CHUNK_TIMEOUT')); }, READ_TIMEOUT_MS);
+            })
+          ]);
+        } catch (readErr) {
+          if (readErr.message === 'CHUNK_TIMEOUT') {
+            console.warn('[Audio] upstream read timeout after ' + READ_TIMEOUT_MS + 'ms, aborting stream');
+            audioAborted = true;
+            try { audioController.abort(); } catch(e) {}
+            break;
+          }
+          throw readErr;
+        }
         if (chunk.done) break;
         res.write(chunk.value);
       }
