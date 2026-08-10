@@ -3041,6 +3041,109 @@ async function kgSearch(keywords, limit) {
   return lists.slice(0, limit).map(mapKGSearchSong);
 }
 
+// 歌单歌曲元数据缓存：播放时用来补全无损 hash
+var KG_SONG_META_CACHE = new Map();
+var KG_QUALITY_HASH_CACHE = new Map();
+var KG_QUALITY_HASH_CACHE_TTL = 60 * 60 * 1000;
+
+function kgRememberTrackMeta(track) {
+  if (!track || typeof track !== 'object') return;
+  var keys = [];
+  if (track.kgHash) keys.push(String(track.kgHash).toLowerCase());
+  if (track.kgFileHash) keys.push(String(track.kgFileHash).toLowerCase());
+  if (track.kgSQHash) keys.push(String(track.kgSQHash).toLowerCase());
+  if (track.kgHQHash) keys.push(String(track.kgHQHash).toLowerCase());
+  var value = {
+    name: track.name || '',
+    artist: track.artist || '',
+    duration: Number(track.duration) || 0,
+    album: track.album || '',
+    albumId: track.kgAlbumId || '',
+    albumAudioId: track.kgAlbumAudioId || '',
+    kgFileHash: track.kgFileHash || '',
+    sqHash: track.kgSQHash || '',
+    hqHash: track.kgHQHash || '',
+    resHash: track.kgResHash || '',
+    at: Date.now(),
+  };
+  keys.forEach(function(key) { if (key) KG_SONG_META_CACHE.set(key, value); });
+}
+
+function kgTextFingerprint(text) {
+  return String(text || '').toLowerCase().replace(/[\s·,，、/&_-]+/g, ' ').trim();
+}
+
+function kgArtistMatches(left, right) {
+  var a = kgTextFingerprint(left).replace(/ /g, '');
+  var b = kgTextFingerprint(right).replace(/ /g, '');
+  if (!a || !b) return false;
+  return a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+}
+
+function kgDurationCloseMs(left, right) {
+  var a = Number(left) || 0;
+  var b = Number(right) || 0;
+  if (!a || !b) return null;
+  return Math.abs(a - b) <= 2000;
+}
+
+function kgPickQualityHashMatch(meta, results) {
+  meta = meta || {};
+  var targetAudioId = String(meta.albumAudioId || '').trim().toLowerCase();
+  var targetHash = String(meta.kgFileHash || meta.kgHash || '').trim().toLowerCase();
+  var targetName = kgTextFingerprint(meta.name || '');
+  var targetArtist = String(meta.artist || '').trim();
+  var targetAlbum = kgTextFingerprint(meta.album || '');
+  var targetAlbumId = String(meta.albumId || '').trim();
+  var targetDuration = Number(meta.duration) || 0;
+  var matches = Array.isArray(results) ? results : [];
+  for (var i = 0; i < matches.length; i++) {
+    var item = matches[i] || {};
+    var audioId = String(item.kgAlbumAudioId || '').trim().toLowerCase();
+    var hash = String(item.kgFileHash || item.kgHash || '').trim().toLowerCase();
+    if ((targetAudioId && audioId && audioId === targetAudioId) || (targetHash && hash && hash === targetHash)) {
+      if (item.kgSQHash || item.kgHQHash || item.kgResHash) return item;
+    }
+  }
+  if (!targetName) return null;
+  var nameMatches = matches.filter(function(item) {
+    if (kgTextFingerprint(item.name) !== targetName) return false;
+    if (targetArtist && item.artist && !kgArtistMatches(item.artist, targetArtist)) return false;
+    if (targetAlbumId && item.kgAlbumId && String(item.kgAlbumId).trim() !== targetAlbumId) return false;
+    if (targetAlbum && item.album && kgTextFingerprint(item.album) !== targetAlbum) return false;
+    return true;
+  });
+  var durationClose = nameMatches.filter(function(item) { return kgDurationCloseMs(item.duration, targetDuration) === true; });
+  var best = durationClose[0] || (targetDuration ? null : nameMatches[0]);
+  if (best && (best.kgSQHash || best.kgHQHash || best.kgResHash)) return best;
+  return null;
+}
+
+async function kgEnrichQualityHashForTrack(meta) {
+  if (!meta) return meta;
+  if (meta.sqHash || meta.hqHash || meta.resHash) return meta;
+  if (!meta.name) return meta;
+  var searchName = meta.name || '';
+  var searchArtist = meta.artist || '';
+  if (!searchArtist && / - /.test(searchName)) {
+    var parts = searchName.split(' - ');
+    searchArtist = parts.slice(0, -1).join(' - ').trim();
+    searchName = parts[parts.length - 1].trim();
+  }
+  var cacheKey = [meta.kgFileHash || meta.kgHash || '', meta.albumAudioId || '', searchName, searchArtist].join('|').toLowerCase();
+  if (!cacheKey) return meta;
+  var cached = KG_QUALITY_HASH_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < KG_QUALITY_HASH_CACHE_TTL) {
+    return Object.assign({}, meta, cached.hashes);
+  }
+  var results = await kgSearch(String(searchName + (searchArtist ? ' ' + searchArtist : '')).trim(), 20);
+  var match = kgPickQualityHashMatch(Object.assign({}, meta, { name: searchName, artist: searchArtist }), results);
+  if (!match) return meta;
+  var hashes = { sqHash: match.kgSQHash || '', hqHash: match.kgHQHash || '', resHash: match.kgResHash || '' };
+  KG_QUALITY_HASH_CACHE.set(cacheKey, { hashes: hashes, at: Date.now() });
+  return Object.assign({}, meta, hashes);
+}
+
 // ============ 酷狗歌曲 URL（5层 VIP 降级链 + 并行 + 缓存） ============
 
 // URL 内存缓存：避免重试时重复调 Kugou API
@@ -3261,14 +3364,44 @@ function looksLossless(ext, bitrate, size) {
   return bitrate >= 700 || size >= 20 * 1024 * 1024;
 }
 
+function kgGatewayVipSignal(resp) {
+  var data = resp && (resp.data || resp);
+  if (!data || typeof data !== 'object') return false;
+  if (data.is_vip === true || data.isVip === true || data.vip === true) return true;
+  if (Number(data.vip_type || data.vipType || data.vip_level || data.vipLevel || data.member_level || data.memberLevel || 0) > 0) return true;
+  return false;
+}
+
 async function kgIsVipAccount() {
   try {
     var text = await kgRequest(KG_VIP_INFO_URL, {
       headers: { ...KG_HEADERS, Host: 'vip.kugou.com', Accept: '*/*', Connection: 'keep-alive' }
     });
     var resp = parseJSONText(text);
-    return !!(resp && resp.errno === 0 && resp.error_code === 0 && resp.vipRemains > 0 && resp.isExpiredMember === 0);
-  } catch (e) { return false; }
+    if (resp && resp.errno === 0 && resp.error_code === 0 && resp.vipRemains > 0 && resp.isExpiredMember === 0) return true;
+  } catch (e) { }
+  try {
+    var cookieObj = kgCookieObject();
+    var clienttime = String(Math.floor(Date.now() / 1000));
+    var base = {
+      dfid: kgCookieDfid(cookieObj) || '-', mid: kgCookieMid(cookieObj) || '-', uuid: '-',
+      appid: KG_LITE_APP_ID, clientver: KG_LITE_VER, clienttime: clienttime,
+      token: kgCookieToken(cookieObj) || '', userid: kgCookieUserId(cookieObj) || 0,
+    };
+    if (!base.token || !base.userid) return false;
+    var attempts = [
+      { path: '/v1/get_union_vip', params: { busi_type: 'concept' } },
+      { path: '/v1/vipuser_sub', params: { busi_type: 'concept' } },
+      { path: '/mobile/vipinfo', params: { plat: 0 } },
+    ];
+    for (var i = 0; i < attempts.length; i++) {
+      try {
+        var gwResp = await kgAndroidPost('https://gateway.kugou.com' + attempts[i].path, Object.assign({}, base, attempts[i].params), '', {});
+        if (kgGatewayVipSignal(gwResp)) return true;
+      } catch (e) { }
+    }
+  } catch (e) { }
+  return false;
 }
 
 async function kgFetchUserInfo() {
@@ -3310,9 +3443,22 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   var loggedIn = kgCookieHasLogin();
   var hasApp = kgHasAppCookie();
 
+  var extras = (typeof albumId === 'object' && albumId) || {};
+  var requestedLevel = normalizeQualityPreference(qualityPreference || '');
+  var wantPremium = requestedLevel === 'lossless' || requestedLevel === 'hires' || requestedLevel === 'jymaster';
+  var meta = KG_SONG_META_CACHE.get(songHash.toLowerCase());
+  if (wantPremium && meta) {
+    meta = await kgEnrichQualityHashForTrack(meta);
+    if (meta && meta.sqHash && !extras.sqHash) extras.sqHash = meta.sqHash;
+    if (meta && meta.hqHash && !extras.hqHash) extras.hqHash = meta.hqHash;
+    if (meta && meta.resHash && !extras.resHash) extras.resHash = meta.resHash;
+    if (meta && (meta.sqHash || meta.hqHash || meta.resHash)) {
+      console.log('[KGSongUrl] enriched hashes for ' + songHash.slice(0, 16) + ': sq=' + (meta.sqHash ? 'Y' : 'N') + ' hq=' + (meta.hqHash ? 'Y' : 'N') + ' res=' + (meta.resHash ? 'Y' : 'N'));
+    }
+  }
+
   // Collect all hash candidates from extra params (albumId object can carry sqHash/hqHash/ogg*Hash/fileHash/resHash)
   var allHashes = [songHash];
-  var extras = (typeof albumId === 'object' && albumId) || {};
   if (extras.sqHash && isValidHash(extras.sqHash)) allHashes.push(extras.sqHash);
   if (extras.hqHash && isValidHash(extras.hqHash)) allHashes.push(extras.hqHash);
   if (extras.ogg320Hash && isValidHash(extras.ogg320Hash)) allHashes.push(extras.ogg320Hash);
@@ -3323,15 +3469,16 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   // 辅助函数：构建统一返回格式
   function makeResult(info, fallbackUrl, layer) {
     if (!info || !info.url) return null;
+    var kbps = kgNormalizeBitrate(info.bitrate || 0);
     return {
       provider: 'kugou', url: info.url,
       fallback: fallbackUrl || '',
       trial: !!info.trial,
       playable: true,
       layer: layer || 'unknown',
-      level: info.bitrate >= 700 ? 'lossless' : (info.bitrate >= 320 ? 'exhigh' : 'standard'),
-      quality: (info.bitrate || '128') + 'k',
-      bitrate: info.bitrate || 128,
+      level: kbps >= 700 ? 'lossless' : (kbps >= 320 ? 'exhigh' : 'standard'),
+      quality: (kbps || 128) + 'k',
+      bitrate: kbps || 128,
     };
   }
 
@@ -3354,7 +3501,8 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   }
 
   // ── 并行解析 Layer 0 (V5) + Layer 1 (Mobile) ──
-  var v5Task = kgFetchURLV5(songHash, '0', extras.albumId || '0').catch(function(e) { console.warn('[KGSongUrl] V5 fetch error:', e.message); return null; });
+  var v5Hash = (wantPremium && extras.sqHash && isValidHash(extras.sqHash)) ? extras.sqHash : songHash;
+  var v5Task = kgFetchURLV5(v5Hash, '0', extras.albumId || '0').catch(function(e) { console.warn('[KGSongUrl] V5 fetch error:', e.message); return null; });
   var mobileTask = kgFetchSongInfo(songHash).catch(function(e) { console.warn('[KGSongUrl] Mobile fetch error:', e.message); return null; });
 
   var [v5Info, mobileInfo] = await Promise.allSettled([v5Task, mobileTask]).then(function(results) {
@@ -3365,10 +3513,10 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   var urlPool = [];
 
   if (v5Info && v5Info.url) {
-    urlPool.push({ url: v5Info.url, bitrate: v5Info.bitrate || 0, trial: !!v5Info.trial, layer: 'v5' });
+    urlPool.push({ url: v5Info.url, bitrate: kgNormalizeBitrate(v5Info.bitrate || 0), trial: !!v5Info.trial, layer: 'v5' });
   }
   if (mobileInfo && mobileInfo.url) {
-    urlPool.push({ url: mobileInfo.url, bitrate: mobileInfo.bitrate || 0, trial: !!mobileInfo.trial, layer: 'mobile' });
+    urlPool.push({ url: mobileInfo.url, bitrate: kgNormalizeBitrate(mobileInfo.bitrate || 0), trial: !!mobileInfo.trial, layer: 'mobile' });
   }
 
   // Layer 2 (已登录且有 App Cookie): Tracker CDN + SonginfoV2
@@ -3378,13 +3526,13 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
       try {
         var trackerInfo = await kgFetchTrackerSongInfo(h);
         if (trackerInfo && trackerInfo.url) {
-          urlPool.push({ url: trackerInfo.url, bitrate: trackerInfo.bitrate || 0, trial: !!trackerInfo.trial, layer: 'tracker' });
+          urlPool.push({ url: trackerInfo.url, bitrate: kgNormalizeBitrate(trackerInfo.bitrate || 0), trial: !!trackerInfo.trial, layer: 'tracker' });
         }
       } catch (e) { /* continue */ }
       try {
         var v2Info = await kgFetchSonginfoV2(h);
         if (v2Info && v2Info.url) {
-          urlPool.push({ url: v2Info.url, bitrate: v2Info.bitrate || 0, trial: !!v2Info.trial, layer: 'v2' });
+          urlPool.push({ url: v2Info.url, bitrate: kgNormalizeBitrate(v2Info.bitrate || 0), trial: !!v2Info.trial, layer: 'v2' });
         }
       } catch (e) { /* continue */ }
     }
@@ -3409,7 +3557,7 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
     console.log('[KGSongUrl] cached ' + urlPool.length + ' fallback URLs for hash=' + songHash.slice(0, 16) + '...');
   }
 
-  var primaryInfo = { url: best.url, bitrate: best.bitrate || 128, trial: best.trial || false };
+  var primaryInfo = { url: best.url, bitrate: kgNormalizeBitrate(best.bitrate || 0) || 128, trial: best.trial || false };
   return makeResult(primaryInfo, fallbackUrl, best.layer);
 }
 
@@ -3916,11 +4064,14 @@ async function kgFetchPlaylistDetail(id) {
 }
 
 async function kgGetPlaylistTracks(id) {
+  var result = null;
   // Check if it's a cloudlist ID
   if (String(id).startsWith('cloudlist:')) {
     var listID = String(id).replace('cloudlist:', '');
     var cookieObj = kgCookieObject();
-    if (!kgHasAppCookie(cookieObj)) return { provider: 'kugou', error: 'Cloud playlist requires app login', tracks: [] };
+    if (!kgHasAppCookie(cookieObj)) {
+      result = { provider: 'kugou', error: 'Cloud playlist requires app login', tracks: [] };
+    } else {
     // Cloudlist needs gateway API with full auth
     var userId = kgCookieUserId(cookieObj);
     var mid = kgCookieMid(cookieObj);
@@ -3957,9 +4108,13 @@ async function kgGetPlaylistTracks(id) {
       }
     }
     allTracks.reverse(); // newest first
-    return { provider: 'kugou', id: id, tracks: allTracks, total: allTracks.length };
+    result = { provider: 'kugou', id: id, tracks: allTracks, total: allTracks.length };
+    }
+  } else {
+    result = await kgFetchPlaylistDetail(id);
   }
-  return kgFetchPlaylistDetail(id);
+  if (result && Array.isArray(result.tracks)) result.tracks.forEach(kgRememberTrackMeta);
+  return result;
 }
 
 function classifyKGPlaybackRestriction(info, session) {
