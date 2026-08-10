@@ -570,6 +570,9 @@ async function resolveAlbumGaplessPlaybackData(song) {
       '&hqHash=' + encodeURIComponent(song.hqHash || song.hq_hash || '') +
       '&sqHash=' + encodeURIComponent(song.sqHash || song.sq_hash || '') +
       '&resHash=' + encodeURIComponent(song.resHash || song.res_hash || '') +
+      '&name=' + encodeURIComponent(song.name || song.title || '') +
+      '&artist=' + encodeURIComponent(song.artist || '') +
+      '&duration=' + encodeURIComponent(song.duration || '') +
       '&vipRequired=' + encodeURIComponent(song.vipRequired || song.needVip || song.onlyVipPlayable || song.only_vip_playable ? '1' : '') +
       '&privilege=' + encodeURIComponent(song.privilege || song.Privilege || song.mediaPrivilege || song.media_privilege || '') +
       '&fee=' + encodeURIComponent(song.fee || song.Fee || '') +
@@ -1100,6 +1103,9 @@ async function playQueueAt(idx, opts) {
           '&hqHash=' + encodeURIComponent(song.hqHash || song.hq_hash || '') +
           '&sqHash=' + encodeURIComponent(song.sqHash || song.sq_hash || '') +
           '&resHash=' + encodeURIComponent(song.resHash || song.res_hash || '') +
+          '&name=' + encodeURIComponent(song.name || song.title || '') +
+          '&artist=' + encodeURIComponent(song.artist || '') +
+          '&duration=' + encodeURIComponent(song.duration || '') +
           '&vipRequired=' + encodeURIComponent(song.vipRequired || song.needVip || song.onlyVipPlayable || song.only_vip_playable ? '1' : '') +
           '&privilege=' + encodeURIComponent(song.privilege || song.Privilege || song.mediaPrivilege || song.media_privilege || '') +
           '&fee=' + encodeURIComponent(song.fee || song.Fee || '') +
