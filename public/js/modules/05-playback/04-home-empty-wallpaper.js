@@ -202,6 +202,24 @@ async function playHomeDaily() {
     showLoginModal({ source: 'home-daily' });
     return;
   }
+  var defaultPlaybackSource = readStoredDefaultSearchMode() || 'kugou';
+  if (defaultPlaybackSource === 'kugou') {
+    try {
+      var kugouFeed = await apiJson('/api/kugou/recommendations?limit=20&t=' + Date.now(), { timeoutMs: 14000 });
+      var kugouSongs = kugouFeed && (kugouFeed.songs || kugouFeed.tracks || kugouFeed.items || kugouFeed.recommendations);
+      if (Array.isArray(kugouSongs) && kugouSongs.length) {
+        playQueue = kugouSongs.map(cloneSong);
+        currentIdx = 0;
+        safeRenderQueuePanel('home-daily-kugou');
+        safeShelfRebuild('home-daily-kugou', true);
+        forcePlaybackControlsInteractive();
+        playQueueAt(0).catch(function (e) { console.warn('[HomeDailyKugouPlay]', e); });
+        return;
+      }
+    } catch (e) {
+      console.warn('[HomeDailyKugouPlay]', e);
+    }
+  }
   await waitForHomeDiscoverIdle();
   if (!homeDiscoverState.loaded || (!homeDiscoverState.songs.length && !homeDiscoverState.loading)) {
     await loadHomeDiscover(true);
