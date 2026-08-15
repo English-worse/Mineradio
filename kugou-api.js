@@ -68,6 +68,7 @@ function createKugouTtlCache(maxEntries, defaultTtlMs) {
 
 const kugouSearchCache = createKugouTtlCache(120, 2 * 60 * 1000);
 const kugouSongUrlCache = createKugouTtlCache(240, 15 * 60 * 1000);
+const kugouQualityHashCache = createKugouTtlCache(240, 60 * 60 * 1000);
 const kugouPlaylistTracksCache = createKugouTtlCache(24, 5 * 60 * 1000);
 const kugouProfileCache = createKugouTtlCache(24, 5 * 60 * 1000);
 const kugouVipCache = createKugouTtlCache(24, 5 * 60 * 1000);
@@ -1177,6 +1178,89 @@ function hashCandidatesFromSong(song, requestedQuality) {
   return out;
 }
 
+function kugouTextFingerprint(text) {
+  return String(text || '').toLowerCase().replace(/[\s·,，、/&_-]+/g, ' ').trim();
+}
+
+function kugouArtistMatches(left, right) {
+  const a = kugouTextFingerprint(left).replace(/ /g, '');
+  const b = kugouTextFingerprint(right).replace(/ /g, '');
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+function kugouDurationCloseMs(left, right) {
+  const a = Number(left) || 0;
+  const b = Number(right) || 0;
+  if (!a || !b) return null;
+  return Math.abs(a - b) <= 2000;
+}
+
+function pickKugouQualityHashMatch(song, results) {
+  song = song || {};
+  const targetAudioId = String(song.albumAudioId || song.album_audio_id || song.mixSongId || '').trim().toLowerCase();
+  const targetHash = String(song.hash || song.fileHash || '').trim().toLowerCase();
+  const targetName = kugouTextFingerprint(song.name || song.title || '');
+  const targetArtist = String(song.artist || (Array.isArray(song.artists) ? song.artists.map(a => a && a.name || '').join('/') : '') || '').trim();
+  const targetAlbum = kugouTextFingerprint(song.album || '');
+  const targetAlbumId = String(song.albumId || song.album_id || '').trim();
+  const targetDuration = Number(song.duration) || 0;
+  const matches = Array.isArray(results) ? results : [];
+  for (const item of matches) {
+    const audioId = String(item.albumAudioId || item.album_audio_id || item.mixSongId || '').trim().toLowerCase();
+    const hash = String(item.hash || item.fileHash || '').trim().toLowerCase();
+    if ((targetAudioId && audioId && audioId === targetAudioId) || (targetHash && hash && hash === targetHash)) {
+      if (item.sqHash || item.hqHash || item.resHash) return item;
+    }
+  }
+  if (!targetName) return null;
+  const nameMatches = matches.filter(item => {
+    if (kugouTextFingerprint(item.name) !== targetName) return false;
+    if (targetArtist && item.artist && !kugouArtistMatches(item.artist, targetArtist)) return false;
+    if (targetAlbumId && item.albumId && String(item.albumId).trim() !== targetAlbumId) return false;
+    if (targetAlbum && item.album && kugouTextFingerprint(item.album) !== targetAlbum) return false;
+    return true;
+  });
+  const durationClose = nameMatches.filter(item => kugouDurationCloseMs(item.duration, targetDuration) === true);
+  const best = durationClose[0] || (targetDuration ? null : nameMatches[0]);
+  if (best && (best.sqHash || best.hqHash || best.resHash)) return best;
+  return null;
+}
+
+function kugouQualityHashCacheKey(song) {
+  song = song || {};
+  return [
+    song.hash || song.fileHash || '',
+    song.albumAudioId || song.album_audio_id || song.mixSongId || '',
+    kugouTextFingerprint(song.name || song.title || ''),
+    kugouTextFingerprint(song.artist || ''),
+    song.albumId || song.album_id || '',
+  ].join('|');
+}
+
+async function kugouEnrichQualityHashes(song, cookie, auth) {
+  song = song || {};
+  if (song.sqHash || song.hqHash || song.resHash) return song;
+  if (!auth || !auth.playbackReady) return song;
+  const cacheKey = kugouQualityHashCacheKey(song);
+  if (!cacheKey) return song;
+  const cached = kugouQualityHashCache.get(cacheKey);
+  if (cached) return Object.assign({}, song, cached);
+  const name = song.name || song.title || '';
+  if (!name) return song;
+  const keywords = String(name + (song.artist ? ' ' + song.artist : '')).trim();
+  const results = await handleKugouSearch(keywords, 20, cookie, 0);
+  const match = pickKugouQualityHashMatch(song, results);
+  if (!match) return song;
+  const enriched = {
+    sqHash: match.sqHash || '',
+    hqHash: match.hqHash || '',
+    resHash: match.resHash || '',
+  };
+  kugouQualityHashCache.set(cacheKey, enriched);
+  return Object.assign({}, song, enriched);
+}
+
 async function handleKugouSearch(keywords, limit, cookie, offset) {
   const kw = String(keywords || '').trim();
   const lim = Math.max(1, Math.min(Number(limit) || 10, 20));
@@ -1231,12 +1315,28 @@ async function handleKugouSongUrl(params, cookie) {
     }, cookie, auth, membership);
   }
   const effectiveQuality = kugouEffectiveQuality(requestedQuality, rightsMembership);
+  const enriched = effectiveQuality === 'standard' ? {} : await kugouEnrichQualityHashes({
+    hash,
+    name: params.name || params.title || '',
+    artist: params.artist || '',
+    album: params.album || '',
+    albumId,
+    albumAudioId,
+    mixSongId: params.mixSongId || '',
+    duration: Number(params.duration) || 0,
+    sqHash: params.sqHash || params.sq_hash || '',
+    hqHash: params.hqHash || params.hq_hash || '',
+    resHash: params.resHash || params.res_hash || '',
+  }, cookie, auth);
   const cacheKey = [
     kugouPlaybackCacheScope(auth, rightsMembership),
     hash.toLowerCase(),
     albumId,
     albumAudioId,
     effectiveQuality,
+    String(params.sqHash || params.sq_hash || enriched.sqHash || '').toLowerCase(),
+    String(params.hqHash || params.hq_hash || enriched.hqHash || '').toLowerCase(),
+    String(params.resHash || params.res_hash || enriched.resHash || '').toLowerCase(),
   ].join(':');
   const cached = kugouSongUrlCache.get(cacheKey);
   if (cached) {
@@ -1246,9 +1346,9 @@ async function handleKugouSongUrl(params, cookie) {
 
   const candidates = hashCandidatesFromSong({
     FileHash: hash,
-    HQFileHash: params.hqHash || params.hq_hash || '',
-    SQFileHash: params.sqHash || params.sq_hash || '',
-    ResFileHash: params.resHash || params.res_hash || '',
+    HQFileHash: params.hqHash || params.hq_hash || enriched.hqHash || '',
+    SQFileHash: params.sqHash || params.sq_hash || enriched.sqHash || '',
+    ResFileHash: params.resHash || params.res_hash || enriched.resHash || '',
   }, effectiveQuality);
   if (!candidates.length) candidates.push({ hash, level: 'standard', label: '标准' });
 

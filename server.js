@@ -5562,6 +5562,10 @@ const server = http.createServer(async (req, res) => {
         onlyVipPlayable: url.searchParams.get('onlyVipPlayable') || url.searchParams.get('only_vip_playable') || '',
         privilege: url.searchParams.get('privilege') || url.searchParams.get('mediaPrivilege') || url.searchParams.get('media_privilege') || '',
         fee: url.searchParams.get('fee') || '',
+        name: url.searchParams.get('name') || '',
+        artist: url.searchParams.get('artist') || '',
+        album: url.searchParams.get('album') || '',
+        duration: url.searchParams.get('duration') || '',
       }, kugouCookie);
       sendJSON(res, info);
     } catch (err) {
