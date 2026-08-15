@@ -18582,6 +18582,7 @@ async function playQueueAt(idx, opts) {
       if (song.kgResHash) kgParams += '&resHash=' + encodeURIComponent(song.kgResHash);
       if (song.kgPrivilege) kgParams += '&privilege=' + song.kgPrivilege;
       kgParams += qualityParam;
+      kgParams += '&duration=' + encodeURIComponent(playbackDurationFromSong(song));
       data = await apiJson('/api/kg/song/url?' + kgParams);
     } else {
       data = await apiJson('/api/song/url?id=' + song.id + qualityParam);
@@ -18883,6 +18884,7 @@ async function retryKGStream(song, idx, token, opts, resumePos, retryCount) {
       var kgParams = 'hash=' + encodeURIComponent(song.kgHash || song.id || '') + '&albumId=' + encodeURIComponent(song.kgAlbumId || '0');
       kgParams += '&quality=' + encodeURIComponent(retryQuality);
       kgParams += '&retry=' + retryCount;
+      kgParams += '&duration=' + encodeURIComponent(playbackDurationFromSong(song));
       if (song.kgSQHash) kgParams += '&sqHash=' + encodeURIComponent(song.kgSQHash);
       if (song.kgHQHash) kgParams += '&hqHash=' + encodeURIComponent(song.kgHQHash);
       if (song.kgOgg320Hash) kgParams += '&ogg320Hash=' + encodeURIComponent(song.kgOgg320Hash);

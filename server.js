@@ -3304,7 +3304,7 @@ async function kgFetchUserInfo() {
   } catch (e) { console.warn('[KGUserInfo] fetch failed:', e.message); return null; }
 }
 
-async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
+async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry, duration) {
   var songHash = String(hash || '').trim();
   if (!songHash || songHash.length < 16) return { provider: 'kugou', url: '', error: 'MISSING_HASH', message: 'Missing valid Kugou song hash', playable: false };
   var loggedIn = kgCookieHasLogin();
@@ -3365,10 +3365,10 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   var urlPool = [];
 
   if (v5Info && v5Info.url) {
-    urlPool.push({ url: v5Info.url, bitrate: v5Info.bitrate || 0, trial: !!v5Info.trial, layer: 'v5' });
+    urlPool.push({ url: v5Info.url, bitrate: v5Info.bitrate || 0, trial: !!v5Info.trial, layer: 'v5', size: v5Info.size || 0 });
   }
   if (mobileInfo && mobileInfo.url) {
-    urlPool.push({ url: mobileInfo.url, bitrate: mobileInfo.bitrate || 0, trial: !!mobileInfo.trial, layer: 'mobile' });
+    urlPool.push({ url: mobileInfo.url, bitrate: mobileInfo.bitrate || 0, trial: !!mobileInfo.trial, layer: 'mobile', size: mobileInfo.size || 0 });
   }
 
   // Layer 2 (已登录且有 App Cookie): Tracker CDN + SonginfoV2
@@ -3378,13 +3378,13 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
       try {
         var trackerInfo = await kgFetchTrackerSongInfo(h);
         if (trackerInfo && trackerInfo.url) {
-          urlPool.push({ url: trackerInfo.url, bitrate: trackerInfo.bitrate || 0, trial: !!trackerInfo.trial, layer: 'tracker' });
+          urlPool.push({ url: trackerInfo.url, bitrate: trackerInfo.bitrate || 0, trial: !!trackerInfo.trial, layer: 'tracker', size: trackerInfo.size || 0 });
         }
       } catch (e) { /* continue */ }
       try {
         var v2Info = await kgFetchSonginfoV2(h);
         if (v2Info && v2Info.url) {
-          urlPool.push({ url: v2Info.url, bitrate: v2Info.bitrate || 0, trial: !!v2Info.trial, layer: 'v2' });
+          urlPool.push({ url: v2Info.url, bitrate: v2Info.bitrate || 0, trial: !!v2Info.trial, layer: 'v2', size: v2Info.size || 0 });
         }
       } catch (e) { /* continue */ }
     }
@@ -3398,8 +3398,37 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
     return { provider: 'kugou', url: '', playable: false, error: 'KG_URL_UNAVAILABLE', loggedIn: false, reason: 'login_required', message: '酷狗需要 App 扫码登录后才能播放此歌曲' };
   }
 
-  // 按音质排序（高码率优先），选最好的作为主URL
-  urlPool.sort(function(a, b) { return (b.bitrate || 0) - (a.bitrate || 0); });
+  // ── 基于时长的试听检测：对比 API 返回的文件大小与预期完整文件大小 ──
+  var songDuration = (typeof duration === 'number' && duration > 0) ? duration : (Number(extras.duration) || 0);
+  function kgIsSuspectedTrialByDuration(entry, dur) {
+    if (!dur || dur <= 0 || !entry.bitrate || entry.bitrate <= 0 || !entry.size || entry.size <= 0) return false;
+    // 预期完整文件大小: bitrate(kbps) × 1000 / 8 × duration(seconds)
+    var expectedSize = (entry.bitrate * 1000 / 8) * dur;
+    // 如果实际文件大小 < 预期的 40%，很可能是试听片段
+    if (entry.size < expectedSize * 0.4) {
+      console.log('[KGSongUrl] suspected trial by duration: layer=' + entry.layer +
+        ' size=' + entry.size + ' expected=' + Math.round(expectedSize) +
+        ' ratio=' + (entry.size / expectedSize * 100).toFixed(1) + '%');
+      return true;
+    }
+    return false;
+  }
+
+  if (songDuration > 0) {
+    urlPool.forEach(function(entry) {
+      if (!entry.trial && kgIsSuspectedTrialByDuration(entry, songDuration)) {
+        entry.trial = true;
+        entry.trialReason = 'duration_mismatch';
+      }
+    });
+  }
+
+  // 排序：非试听优先，然后按码率降序
+  urlPool.sort(function(a, b) {
+    if (a.trial && !b.trial) return 1;
+    if (!a.trial && b.trial) return -1;
+    return (b.bitrate || 0) - (a.bitrate || 0);
+  });
   var best = urlPool.shift(); // 取出最好的作为主URL
   var fallbackUrl = urlPool.length > 0 ? urlPool[0].url : '';
 
@@ -3410,7 +3439,13 @@ async function kgGetSongUrl(hash, albumId, qualityPreference, isRetry) {
   }
 
   var primaryInfo = { url: best.url, bitrate: best.bitrate || 128, trial: best.trial || false };
-  return makeResult(primaryInfo, fallbackUrl, best.layer);
+  var result = makeResult(primaryInfo, fallbackUrl, best.layer);
+  // 如果最佳URL被检测为试听，附加额外信息
+  if (best.trial && best.trialReason === 'duration_mismatch') {
+    result.trialReason = 'duration_mismatch';
+    result.message = '酷狗此歌曲可能仅提供试听片段';
+  }
+  return result;
 }
 
 // ============ 酷狗歌词 ============
@@ -4976,7 +5011,7 @@ const server = http.createServer(async (req, res) => {
         fileHash: url.searchParams.get('fileHash') || '',
         resHash: url.searchParams.get('resHash') || '',
       };
-      const info = await kgGetSongUrl(hash, hashExtras, quality, !!url.searchParams.get('retry'));
+      const info = await kgGetSongUrl(hash, hashExtras, quality, !!url.searchParams.get('retry'), parseFloat(url.searchParams.get('duration') || '0'));
       sendJSON(res, info);
     } catch (err) {
       console.error('[KGSongUrl]', err);
