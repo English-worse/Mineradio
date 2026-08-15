@@ -3733,6 +3733,7 @@ ipcMain.handle('desktop-window-minimize', async (event) => {
   if (win === mainWindow && fullDesktopModeRuntime.getStatus('window-minimize').enabled === true) {
     return setFullDesktopModeInteractive(false, 'window-minimize');
   }
+  if (win) win.__mineradioUserMinimizeRequested = true;
   win?.minimize();
   return getWindowState(win);
 });
@@ -5043,15 +5044,22 @@ function clearMainWindowFullscreenVisibilityGuard() {
 
 function shouldRestoreUnexpectedFullscreenVisibility(win) {
   if (!win || win.isDestroyed() || appQuitting || win.__mineradioIntentionalHide === true) return false;
+  if (win.__mineradioUserMinimizeRequested === true) return false;
   if (fullDesktopModeHostVisibilityTransitionDepth > 0 || fullDesktopModeRuntime.getStatus('fullscreen-visibility-guard').enabled === true) return false;
-  if (!win.isFullScreen() || win.isMinimized() || win.isVisible()) return false;
-  return true;
+  if (!win.isFullScreen()) return false;
+  if (win.isMinimized() || !win.isVisible()) return true;
+  return false;
 }
 
 function restoreUnexpectedFullscreenVisibility(win, reason = 'fullscreen-visibility-guard') {
   if (!shouldRestoreUnexpectedFullscreenVisibility(win)) return false;
   console.warn('[WindowRecovery] restoring unexpectedly hidden fullscreen window:', reason);
-  try { win.showInactive(); } catch (_) { try { win.show(); } catch (_) { } }
+  if (win.isMinimized()) {
+    try { win.restore(); } catch (_) { }
+  }
+  if (!win.isVisible()) {
+    try { win.showInactive(); } catch (_) { try { win.show(); } catch (_) { } }
+  }
   sendWindowState(win);
   return true;
 }
@@ -5369,11 +5377,13 @@ async function createWindowOnce() {
   });
   win.on('restore', () => {
     win.__mineradioIntentionalHide = false;
+    win.__mineradioUserMinimizeRequested = false;
     sendWindowState(win);
     if (fullDesktopModeHostVisibilityTransitionDepth <= 0) resumeWallpaperEngineForVisibleHost(win, 'restore');
   });
   win.on('show', () => {
     win.__mineradioIntentionalHide = false;
+    win.__mineradioUserMinimizeRequested = false;
     if (fullDesktopModeHostVisibilityTransitionDepth > 0) return;
     sendWindowState(win);
     resumeWallpaperEngineForVisibleHost(win, 'show');
