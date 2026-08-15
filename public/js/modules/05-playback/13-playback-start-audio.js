@@ -625,6 +625,10 @@ async function resolveAlbumGaplessPlaybackData(song) {
       '&vipRequired=' + encodeURIComponent(song.vipRequired || song.needVip || song.onlyVipPlayable || song.only_vip_playable ? '1' : '') +
       '&privilege=' + encodeURIComponent(song.privilege || song.Privilege || song.mediaPrivilege || song.media_privilege || '') +
       '&fee=' + encodeURIComponent(song.fee || song.Fee || '') +
+      '&name=' + encodeURIComponent(song.name || song.title || '') +
+      '&artist=' + encodeURIComponent(song.artist || (Array.isArray(song.artists) ? song.artists.map(a => a && a.name || '').join('/') : '') || '') +
+      '&album=' + encodeURIComponent(song.album || '') +
+      '&duration=' + encodeURIComponent(song.duration || song.dt || 0) +
       qualityParam, { timeoutMs: 20000 });
   }
   if (playbackProvider === 'qishui') {
@@ -1185,6 +1189,10 @@ async function playQueueAt(idx, opts) {
           '&vipRequired=' + encodeURIComponent(song.vipRequired || song.needVip || song.onlyVipPlayable || song.only_vip_playable ? '1' : '') +
           '&privilege=' + encodeURIComponent(song.privilege || song.Privilege || song.mediaPrivilege || song.media_privilege || '') +
           '&fee=' + encodeURIComponent(song.fee || song.Fee || '') +
+          '&name=' + encodeURIComponent(song.name || song.title || '') +
+          '&artist=' + encodeURIComponent(song.artist || (Array.isArray(song.artists) ? song.artists.map(a => a && a.name || '').join('/') : '') || '') +
+          '&album=' + encodeURIComponent(song.album || '') +
+          '&duration=' + encodeURIComponent(song.duration || song.dt || 0) +
           qualityParam, { timeoutMs: 20000 });
       } else if (isQishuiPlayback) {
         data = await apiJson('/api/qishui/song/url?id=' + encodeURIComponent(song.id || song.providerSongId || '') + qqPlaybackEvidenceQuery(song) + qualityParam, { timeoutMs: 15000 });
