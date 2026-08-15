@@ -1,3 +1,5 @@
+var autoDefaultSourceMatchInFlight = false;
+
 function albumGaplessSongKey(song) {
   if (!song) return '';
   if (song.__albumGaplessKey) return String(song.__albumGaplessKey);
@@ -996,6 +998,28 @@ async function playQueueAt(idx, opts) {
     markPlayPhase('track-setup');
     var song = safePlaybackStep('hydrate-song', function () { return hydrateCustomCover(playQueue[idx]); }) || playQueue[idx];
     playQueue[idx] = song;
+    if (!opts.sourceSwitch && !song.__defaultSourceChecked) {
+      song.__defaultSourceChecked = true;
+      var defaultPlaybackSource = readStoredDefaultSearchMode() || 'kugou';
+      if (defaultPlaybackSource === 'kugou' && songProviderKey(song) !== 'kugou' && song.type !== 'local' && song.type !== 'podcast' && song.source !== 'local' && !song.localUrl) {
+        if (!autoDefaultSourceMatchInFlight) {
+          autoDefaultSourceMatchInFlight = true;
+          try {
+            var defaultKugouMatch = await findControlSourceMatch(song, 'kugou', 2500);
+            if (token === trackSwitchToken && currentIdx === idx && defaultKugouMatch && defaultKugouMatch.hash) {
+              defaultKugouMatch.manualSourceSwitchFrom = songProviderKey(song);
+              defaultKugouMatch.defaultSourceAppliedAt = Date.now();
+              song = hydrateCustomCover(defaultKugouMatch);
+              playQueue[idx] = song;
+              if (typeof updateControlTrackInfo === 'function') updateControlTrackInfo(song);
+              if (typeof showSourceFallbackNotice === 'function') showSourceFallbackNotice('默认音源', '已自动使用酷狗音源');
+            }
+          } finally {
+            autoDefaultSourceMatchInFlight = false;
+          }
+        }
+      }
+    }
     var sameAlbumCoverSwitch = albumGaplessSameAlbumCover(previousSongForTransition, song);
     var earlyLyricFetchStarted = false;
     function startTrackLyricFetch() {

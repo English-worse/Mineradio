@@ -203,7 +203,33 @@ function updateSearchModeTabs() {
   }
   if ($input && searchMode === 'qishui') $input.placeholder = '搜索汽水音乐匹配源...';
   if ($input && searchMode === 'spotify') $input.placeholder = '搜索 Spotify 匹配源...';
+  updateSearchDefaultButton();
   requestAnimationFrame(updateSearchPillGlassDisplacementMap);
+}
+function defaultSearchModeLabel(mode) {
+  if (mode === 'netease') return '网易云';
+  if (mode === 'qq') return 'QQ';
+  if (mode === 'kugou') return '酷狗';
+  if (mode === 'qishui') return '汽水';
+  if (mode === 'spotify') return 'Spotify';
+  return '全部';
+}
+function updateSearchDefaultButton() {
+  var btn = document.getElementById('search-mode-default-btn');
+  if (!btn) return;
+  var stored = readStoredDefaultSearchMode() || 'kugou';
+  btn.textContent = '默认:' + (stored === 'song' ? 'All' : stored.toUpperCase());
+  btn.title = '当前默认音源: ' + defaultSearchModeLabel(stored) + '。点击把当前音源设为默认';
+}
+function setCurrentSearchModeAsDefault() {
+  var mode = searchMode;
+  if (mode === 'podcast') {
+    showToast('播客不能设为默认音源');
+    return;
+  }
+  try { localStorage.setItem('mineradio-default-source-v1', mode); } catch (_) {}
+  updateSearchDefaultButton();
+  showToast('默认音源已设为: ' + defaultSearchModeLabel(mode));
 }
 function setSearchMode(mode) {
   mode = (mode === 'podcast' || mode === 'netease' || mode === 'qq' || mode === 'kugou' || mode === 'qishui' || mode === 'spotify') ? mode : 'song';
@@ -533,6 +559,7 @@ function renderControlSourceSwitcher(matches) {
   el.classList.toggle('loading', !!controlSourceSwitcherState.loading);
   el.innerHTML =
     '<div class="control-source-switcher-head"><span>切换音源</span><small>' + (controlSourceSwitcherState.loading ? '正在匹配' : '保留当前进度') + '</small></div>' +
+    '<div class="control-source-default-row"><span>默认播放源</span><button type="button" class="control-source-default-btn" onclick="setDefaultControlSource()">设为当前</button><small>' + escHtml(controlSourceDefaultLabel()) + '</small></div>' +
     '<div class="control-source-options">' +
     controlSourceProviders().map(function (provider) {
       var entry = matches[provider.key];
@@ -553,10 +580,26 @@ function renderControlSourceSwitcher(matches) {
     '</div>';
   controlSourcePositionSwitcher();
 }
-async function findControlSourceMatchResult(song, provider) {
+function controlSourceDefaultLabel() {
+  var stored = readStoredDefaultSearchMode() || 'kugou';
+  if (stored === 'song') stored = 'kugou';
+  return controlSourceProviderTitle(stored);
+}
+function setDefaultControlSource() {
+  var song = currentControlSong();
+  if (!song || song.type === 'local' || song.source === 'local' || song.localUrl || song.type === 'podcast') {
+    showToast('当前歌曲不能设为默认播放源');
+    return;
+  }
+  var provider = songProviderKey(song);
+  try { localStorage.setItem('mineradio-default-source-v1', provider); } catch (_) {}
+  showToast('默认播放源已设为: ' + controlSourceProviderTitle(provider));
+  closeControlSourceSwitcher();
+}
+async function findControlSourceMatchResult(song, provider, timeoutMs) {
   var query = controlSourceSwitchQuery(song);
   if (!query) return { song: null, issue: 'no_source' };
-  var data = await apiJson(controlSourceSearchUrl(provider, query), { timeoutMs: 6000 });
+  var data = await apiJson(controlSourceSearchUrl(provider, query), { timeoutMs: timeoutMs || 6000 });
   var list = data && (data.songs || data.result || []);
   if (!Array.isArray(list) || !list.length) return { song: null, issue: 'no_source' };
   var best = null;
@@ -579,8 +622,8 @@ async function findControlSourceMatchResult(song, provider) {
   }
   return best && bestScore >= 24 ? { song: cloneSong(best), issue: '' } : { song: null, issue: bestIssue };
 }
-async function findControlSourceMatch(song, provider) {
-  var strictResult = await findControlSourceMatchResult(song, provider);
+async function findControlSourceMatch(song, provider, timeoutMs) {
+  var strictResult = await findControlSourceMatchResult(song, provider, timeoutMs);
   return strictResult && strictResult.song ? strictResult.song : null;
 }
 async function loadControlSourceMatches(song, requestId) {
@@ -751,7 +794,7 @@ function searchIntentPrefersQQ(q) {
   q = String(q || '').toLowerCase();
   return /(^|\s)qq($|\s)|qq音乐|qq音樂/.test(q);
 }
-var MUSIC_SEARCH_PROVIDER_ORDER = ['netease', 'qq', 'kugou', 'qishui', 'spotify'];
+var MUSIC_SEARCH_PROVIDER_ORDER = ['kugou', 'netease', 'qq', 'qishui', 'spotify'];
 function searchProviderStatus(provider) {
   if (typeof platformStatus === 'function') return platformStatus(provider);
   if (provider === 'spotify') return spotifyLoginStatus;

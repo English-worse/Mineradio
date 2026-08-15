@@ -1801,6 +1801,7 @@ function mapKugouPlaylistTrack(item) {
   const singers = Array.isArray(item.singerinfo) ? item.singerinfo : (Array.isArray(item.Singers) ? item.Singers : []);
   const artistLabel = singers.map(s => s.name || s.SingerName).filter(Boolean).join(' / ');
   const mixSongId = item.mixsongid != null ? String(item.mixsongid) : (item.MixSongID != null ? String(item.MixSongID) : (item.album_audio_id != null ? String(item.album_audio_id) : ''));
+  const durationSec = Number(item.duration || item.time_length || item.timelength_320 || 0) || 0;
   const mapped = mapKugouSearchItem(Object.assign({}, item, {
     FileHash: item.hash || item.FileHash,
     SongName: stripKugouFileName(item.name || item.SongName || item.filename, artistLabel),
@@ -1811,8 +1812,11 @@ function mapKugouPlaylistTrack(item) {
     EMixSongID: (/^\d+$/.test(mixSongId) ? mixSongId : '') || item.album_audio_id || item.EMixSongID,
     AlbumName: (item.albuminfo && item.albuminfo.name) || item.album_name || item.AlbumName,
     Image: item.cover || item.img || item.Image || (item.trans_param && item.trans_param.union_cover),
-    Duration: item.duration || (item.timelen ? Math.round(Number(item.timelen) / 1000) : 0) || item.Duration,
+    Duration: item.duration || (item.timelen ? Math.round(Number(item.timelen) / 1000) : 0) || durationSec || item.Duration,
     Privilege: item.media_privilege != null ? item.media_privilege : (item.privilege != null ? item.privilege : item.Privilege),
+    HQFileHash: item.hash_320 || item.HQFileHash,
+    SQFileHash: item.hash_flac || item.hash_ape || item.SQFileHash,
+    Audioid: item.audioid || item.Audioid || item.scid || item.Scid,
   }));
   if (!mapped.hash && item.hash) mapped.hash = item.hash;
   if (!mapped.albumAudioId && item.album_audio_id) mapped.albumAudioId = String(item.album_audio_id);
@@ -2230,25 +2234,47 @@ async function handleKugouPlaylistAddSong(listId, song, cookie) {
   return handleKugouAddSongToList(listId, song, cookie);
 }
 
-function kugouSignParamsKey(clienttime) {
-  return crypto.createHash('md5').update(`${KUGOU_APPID}${KUGOU_CLIENTVER}${clienttime}${KUGOU_ANDROID_SALT}`).digest('hex');
+function kugouSignParamsKey(clienttime, appid, clientver) {
+  appid = appid == null ? KUGOU_APPID : appid;
+  clientver = clientver == null ? KUGOU_CLIENTVER : clientver;
+  return crypto.createHash('md5').update(`${appid}${KUGOU_ANDROID_SALT}${clientver}${clienttime}`).digest('hex');
 }
 
-function extractKugouGuessSongList(json) {
+async function fetchKugouPersonalFmBatch(cookie, auth) {
+  const clienttime = Date.now();
+  const userId = Number(auth.userid || 0);
+  const personalBody = {
+    appid: KUGOU_APPID,
+    clienttime,
+    mid: auth.mid,
+    action: 'play',
+    recommend_source_locked: 0,
+    song_pool_id: 0,
+    callerid: 0,
+    m_type: 1,
+    platform: 'ios',
+    area_code: 1,
+    remain_songcnt: 0,
+    clientver: KUGOU_CLIENTVER,
+    is_overplay: 0,
+    mode: 'normal',
+    fakem: 'ca981cfc583a4c37f28d2d49000013c16a0a',
+    key: kugouSignParamsKey(clienttime),
+    userid: userId,
+    kguid: userId,
+    token: auth.token,
+  };
+  const json = await kugouGatewayRequest('/v2/personal_recommend', {
+    cookie,
+    method: 'POST',
+    body: personalBody,
+    router: 'persnfm.service.kugou.com',
+  });
   const data = json && json.data;
-  const candidates = [
-    data && data.info,
-    data && data.song_list,
-    data && data.songs,
-    data && data.list,
-    data && data.songlist,
-    json && json.info,
-    json && json.list,
-  ];
-  for (let i = 0; i < candidates.length; i++) {
-    if (Array.isArray(candidates[i]) && candidates[i].length) return candidates[i];
-  }
-  return [];
+  const personalList = data && (data.song_list || data.info || data.songs);
+  return Array.isArray(personalList)
+    ? personalList.map(mapKugouPlaylistTrack).filter(s => s.name && (s.hash || s.id))
+    : [];
 }
 
 async function handleKugouGuessLike(cookie, limit) {
@@ -2257,31 +2283,49 @@ async function handleKugouGuessLike(cookie, limit) {
   if (!auth.playbackReady) {
     return { provider: 'kugou', loggedIn: false, songs: [], error: 'KUGOU_AUTH_REQUIRED' };
   }
-  const clienttime = Date.now();
-  const payload = {
-    appid: KUGOU_APPID,
-    area_code: 1,
-    clienttime,
-    clientver: KUGOU_CLIENTVER,
-    data: [{ fmid: '0', fmtype: 2, offset: -1, size: limit, singername: '' }],
-    get_tracker: 1,
-    key: kugouSignParamsKey(clienttime),
-    mid: auth.mid,
-    uid: Number(auth.userid || 0),
-  };
   try {
-    const json = await kugouGatewayRequest('/v1/app_song_list_offset', {
-      cookie,
-      method: 'POST',
-      body: payload,
-      router: 'fm.service.kugou.com',
-    });
-    const songs = extractKugouGuessSongList(json).map(mapKugouPlaylistTrack).filter(s => s.name && (s.hash || s.id));
+    const songs = [];
+    const seen = new Set();
+    const rounds = Math.min(3, Math.ceil(limit / 5));
+    for (let round = 0; round < rounds; round += 1) {
+      const batch = await fetchKugouPersonalFmBatch(cookie, auth);
+      for (const song of batch) {
+        const key = song.hash || song.albumAudioId || song.name;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        songs.push(Object.assign({}, song, { playable: true }));
+        if (songs.length >= limit) break;
+      }
+      if (songs.length >= limit) break;
+    }
     if (songs.length) {
       return { provider: 'kugou', loggedIn: true, songs: songs.slice(0, limit), updatedAt: Date.now() };
     }
   } catch (e) {
-    console.warn('[KugouGuessLike] fm:', e.message);
+    console.warn('[KugouGuessLike] personal fm:', e.message);
+  }
+  try {
+    const json = await kugouGatewayRequest('/everyday_song_recommend', {
+      cookie,
+      method: 'POST',
+      body: {
+        platform: 'android',
+        userid: Number(auth.userid || 0),
+      },
+      params: { platform: 'ios' },
+      router: 'everydayrec.service.kugou.com',
+    });
+    const data = json && json.data;
+    const dailyList = data && (data.song_list || data.info || data.songs);
+    const songs = Array.isArray(dailyList)
+      ? dailyList.map(song => Object.assign({}, mapKugouPlaylistTrack(song), { playable: true }))
+        .filter(s => s.name && (s.hash || s.id))
+      : [];
+    if (songs.length) {
+      return { provider: 'kugou', loggedIn: true, songs: songs.slice(0, limit), updatedAt: Date.now() };
+    }
+  } catch (e) {
+    console.warn('[KugouGuessLike] everyday recommend:', e.message);
   }
   return { provider: 'kugou', loggedIn: true, songs: [], error: 'KUGOU_GUESS_EMPTY', updatedAt: Date.now() };
 }

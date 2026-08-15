@@ -1241,13 +1241,16 @@ function openHomePlatformRecommendations(preferredSource) {
   homePlatformRecommendationState.open = true;
   mask.classList.add('show');
   mask.setAttribute('aria-hidden', 'false');
-  var defaultSource = loginStatus && loginStatus.loggedIn
-    ? 'netease'
-    : (qishuiLoginStatus && (qishuiLoginStatus.loggedIn || qishuiLoginStatus.configured)
-      ? 'qishui'
-      : (kugouLoginStatus && kugouLoginStatus.loggedIn
-        ? 'kugou'
-        : (spotifyLoginStatus && (spotifyLoginStatus.loggedIn || spotifyLoginStatus.configured) ? 'spotify' : 'netease')));
+  var storedDefault = readStoredDefaultSearchMode();
+  var defaultSource = /^(netease|qishui|qq|kugou|spotify)$/.test(storedDefault)
+    ? storedDefault
+    : (kugouLoginStatus && kugouLoginStatus.loggedIn
+      ? 'kugou'
+      : (loginStatus && loginStatus.loggedIn
+        ? 'netease'
+        : (qishuiLoginStatus && (qishuiLoginStatus.loggedIn || qishuiLoginStatus.configured)
+          ? 'qishui'
+          : (spotifyLoginStatus && (spotifyLoginStatus.loggedIn || spotifyLoginStatus.configured) ? 'spotify' : 'netease'))));
   var source = /^(netease|qishui|qq|kugou|spotify)$/.test(String(preferredSource || '')) ? preferredSource : defaultSource;
   loadHomePlatformRecommendations(source, false);
   setTimeout(function () {

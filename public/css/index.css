@@ -5425,6 +5425,45 @@ body.home-controls-locked #bottom-bar {
   white-space: nowrap
 }
 
+.control-source-default-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 2px 9px;
+  margin-bottom: 6px;
+  border-top: 1px solid rgba(255, 255, 255, .07);
+  border-bottom: 1px solid rgba(255, 255, 255, .07);
+  font-size: 11px;
+  color: rgba(255, 255, 255, .62)
+}
+
+.control-source-default-btn {
+  flex: 0 0 auto;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .10);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .06);
+  color: rgba(255, 255, 255, .82);
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 750;
+  cursor: pointer;
+  transition: background .18s, color .18s, border-color .18s
+}
+
+.control-source-default-btn:hover {
+  background: rgba(255, 255, 255, .12);
+  border-color: rgba(var(--fc-accent-rgb), .30)
+}
+
+.control-source-default-row small {
+  color: rgba(255, 255, 255, .42);
+  font-size: 10px;
+  white-space: nowrap
+}
+
 .control-source-options {
   display: grid;
   grid-template-columns: 1fr;

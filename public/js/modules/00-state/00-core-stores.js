@@ -20,7 +20,15 @@ var lastStrongDrop = 0;           // 用于 burst 预设的强 drop 时刻
 
 var lyricsLines = [], lyricsTranslationLines = [], lyricsVisible = false, lyricsHasNativeKaraoke = false, lyricsTimingSource = 'none', lyricsTranslationSource = 'none';
 var playlist = [], playQueue = [], currentIdx = -1, playing = false, playToggleBusy = false;
-var searchMode = 'song', podcastResults = [], podcastPrograms = [], podcastCurrentRadio = null;
+function readStoredDefaultSearchMode() {
+  try {
+    var raw = localStorage.getItem('mineradio-default-source-v1');
+    var value = String(raw || '').trim();
+    if (value === 'song' || value === 'netease' || value === 'qq' || value === 'kugou' || value === 'qishui' || value === 'spotify') return value;
+  } catch (_) {}
+  return '';
+}
+var searchMode = readStoredDefaultSearchMode() || 'kugou', podcastResults = [], podcastPrograms = [], podcastCurrentRadio = null;
 var loginStatus = { loggedIn: false, vipType: 0, vipLevel: 'none', isVip: false, isSvip: false, vipLabel: '无VIP' };
 var qqLoginStatus = { provider: 'qq', loggedIn: false, preview: false, nickname: 'QQ 音乐', userId: '', avatar: '', vipType: 0, vipLevel: 'none', isVip: false, isSvip: false };
 var kugouLoginStatus = { provider: 'kugou', loggedIn: false, preview: false, nickname: '酷狗音乐', userId: '', avatar: '', vipType: 0, vipLevel: 'none', isVip: false, isSvip: false, playbackKeyReady: false };
