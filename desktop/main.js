@@ -5043,11 +5043,24 @@ function clearMainWindowFullscreenVisibilityGuard() {
 }
 
 function shouldRestoreUnexpectedFullscreenVisibility(win) {
-  if (!win || win.isDestroyed() || appQuitting || win.__mineradioIntentionalHide === true) return false;
+  if (!win || win.isDestroyed() || appQuitting || !startupCompleted || win.__mineradioIntentionalHide === true) return false;
   if (win.__mineradioUserMinimizeRequested === true) return false;
   if (fullDesktopModeHostVisibilityTransitionDepth > 0 || fullDesktopModeRuntime.getStatus('fullscreen-visibility-guard').enabled === true) return false;
-  if (!win.isFullScreen()) return false;
   if (win.isMinimized() || !win.isVisible()) return true;
+  if (win.isVisible()) {
+    try {
+      const bounds = win.getBounds();
+      if (!Number.isFinite(bounds.x) || !Number.isFinite(bounds.y) || !Number.isFinite(bounds.width) || !Number.isFinite(bounds.height)) return true;
+      const insideDisplay = screen.getAllDisplays().some(display => {
+        const area = display.workArea;
+        return bounds.x < area.x + area.width
+          && bounds.x + bounds.width > area.x
+          && bounds.y < area.y + area.height
+          && bounds.y + bounds.height > area.y;
+      });
+      if (!insideDisplay) return true;
+    } catch (_) { }
+  }
   return false;
 }
 
@@ -5060,6 +5073,7 @@ function restoreUnexpectedFullscreenVisibility(win, reason = 'fullscreen-visibil
   if (!win.isVisible()) {
     try { win.showInactive(); } catch (_) { try { win.show(); } catch (_) { } }
   }
+  try { ensureMainWindowInsideDisplay(win); } catch (_) { }
   sendWindowState(win);
   return true;
 }
@@ -5368,6 +5382,7 @@ async function createWindowOnce() {
   });
 
   win.once('ready-to-show', () => showMainWindowSafely(win, 'ready-to-show'));
+  startMainWindowFullscreenVisibilityGuard(win);
   win.on('maximize', () => sendWindowState(win));
   win.on('unmaximize', () => sendWindowState(win));
   win.on('minimize', () => {
@@ -5499,7 +5514,6 @@ async function createWindowOnce() {
   win.on('leave-full-screen', () => {
     windowFullscreenActive = false;
     setMainWindowFullscreenResizeGuard(win, false);
-    clearMainWindowFullscreenVisibilityGuard();
     setTimeout(() => {
       applyWindowedBounds(win);
       scheduleWallpaperEngineHostBoundsRestart(win, 'leave-full-screen');
