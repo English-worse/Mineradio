@@ -789,7 +789,7 @@ function searchIntentPrefersQQ(q) {
   q = String(q || '').toLowerCase();
   return /(^|\s)qq($|\s)|qq音乐|qq音樂/.test(q);
 }
-var MUSIC_SEARCH_PROVIDER_ORDER = ['kugou', 'netease', 'qq', 'qishui', 'spotify'];
+var MUSIC_SEARCH_PROVIDER_ORDER = ['kugou', 'netease', 'qq', 'qishui'];
 function searchProviderStatus(provider) {
   if (typeof platformStatus === 'function') return platformStatus(provider);
   if (provider === 'spotify') return spotifyLoginStatus;
